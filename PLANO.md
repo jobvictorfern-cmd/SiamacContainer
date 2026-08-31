@@ -165,6 +165,69 @@ Utilitário de linha de comando que, apontado para uma câmera, mede **ao vivo**
 
 ## 5. Arquitetura de software
 
+### 5.0 Stack
+
+**A decisão estrutural é que existem dois ambientes, e eles nunca se misturam.**
+
+```
+┌─ TREINO ──────────────────┐        ┌─ PRODUÇÃO ────────────────┐
+│ nossa máquina, com GPU    │        │ PC da portaria, offline   │
+│ PaddlePaddle + PaddleOCR  │ .onnx  │ ONNX Runtime + RapidOCR   │
+│ pesado, ~4 GB             │ ─────► │ leve, ~250 MB             │
+│ roda algumas vezes        │        │ roda 24/7 como serviço    │
+└───────────────────────────┘        └───────────────────────────┘
+```
+
+O produto entregue **não contém PaddlePaddle**. O único artefato que atravessa a fronteira é o `.onnx`. O CI verifica isso (§10).
+
+#### Produção — o que vai no PC do cliente
+
+| Camada | Escolha | Por quê |
+|---|---|---|
+| Runtime | **Python 3.13** | Wheels maduras em `onnxruntime`, `opencv` e `PyInstaller`. O 3.14 ainda está entrando no onnxruntime — não vale o risco num sistema offline |
+| Dependências | **uv** + lockfile | Reprodutível e rápido. `uv export` gera o requirements travado para o build sem rede |
+| Inferência | **onnxruntime** (CPU) | ~50 MB. Sem PaddlePaddle, sem PaddleX, sem conflito de DLL |
+| OCR | **rapidocr** (Apache-2.0) | Pré/pós-processamento PP-OCR já resolvido |
+| Visão | **opencv-python-headless** | ⚠️ **`headless`, não o pacote cheio.** O completo arrasta Qt, é ~50 MB maior, e um serviço Windows não tem sessão gráfica para inicializá-lo |
+| RTSP | **PyAV** | ⚠️ `cv2.VideoCapture` **trava indefinidamente** quando a câmera some — sem timeout confiável. Num serviço 24/7 isso é uma thread morta silenciosa. PyAV dá controle real de timeout e reconexão |
+| HTTP client | **httpx** | Snapshot CGI e webhook. Timeouts sãos por padrão, sync e async na mesma API |
+| ONVIF | **onvif-zeep-async** | Descoberta, snapshot URI, hora, eventos PullPoint |
+| API + UI | **FastAPI** + **uvicorn** | Um processo serve os dois binds (§5.3). OpenAPI automática para a integração |
+| Templates | **Jinja2 + HTMX** (arquivo local) | Sem `npm`, sem build step. O instalador offline não precisa de toolchain de frontend |
+| Banco | **SQLite** + **SQLAlchemy 2.x** + **Alembic** | Arquivo único, zero administração, migração versionada |
+| Config | **pydantic-settings** + **PyYAML** | Valida no boot e **falha alto**. Config errada não pode virar comportamento estranho três dias depois |
+| Logs | **structlog** → JSON em arquivo rotativo | Serviço não tem console. Log estruturado é o que torna o diagnóstico remoto possível |
+| Empacotamento | **PyInstaller** em modo **`onedir`** | ⚠️ **Não `onefile`:** ele extrai tudo para o temp a cada boot (lento, e permissão de temp sob `LocalSystem` é imprevisível) e dispara heurística de antivírus corporativo |
+| Serviço | **WinSW** (MIT) | Envelopa o `.exe` como serviço Windows, com restart automático |
+| Instalador | **Inno Setup** | Embarca o VC++ Redistributable e cria a regra de firewall |
+
+#### Treino — máquina separada
+
+| Camada | Escolha |
+|---|---|
+| Runtime | **Python 3.12** — mais conservador; o ecossistema de treino é mais rodado nele |
+| Framework | **PaddlePaddle (GPU)** + **PaddleOCR clonado do repositório** (não o pacote pip — precisamos de `configs/rec/` e `tools/train.py`) |
+| Export | **paddle2onnx** + **onnxsim** |
+| Sintéticos | **SynthTIGER** ou **TextRecognitionDataGenerator** |
+| Anotação | **PPOCRLabel v3** |
+| Experimentos | CSV ou SQLite simples. MLflow só se o número de experimentos justificar — não antes |
+
+#### Desenvolvimento e CI
+
+**pytest** + `pytest-asyncio` + `pytest-cov` · **httpx** como cliente de teste · **MediaMTX** servindo RTSP falso · **ruff** (lint e format) · **mypy** no núcleo (`iso6346`, `fusion`, `storage`) · GitHub Actions em matriz Linux + Windows
+
+#### Descartados, e por quê
+
+| Alternativa | Por que não |
+|---|---|
+| **Docker no cliente** | Windows offline, serviço nativo. Docker Desktop adiciona licença, camada de virtualização e um ponto de falha no boot |
+| **PostgreSQL** | Nó único, um banco pequeno. SQLite não tem administração — e administração remota por VPN é o que queremos evitar |
+| **React / Vue** | Build step de frontend dentro de um instalador offline é dor sem retorno. HTMX cobre o caso |
+| **Celery + Redis** | O outbox é uma tabela SQLite com um worker asyncio. Dois serviços a menos para subir no boot |
+| **Nuitka** no lugar do PyInstaller | Binário melhor, mas build frágil com `opencv` e `onnxruntime`. PyInstaller é o caminho conhecido e depurável |
+| **GPU (CUDA)** | Só se a medição exigir. E aí **DirectML (~40 MB)**, não CUDA — as DLLs do provider CUDA somam ~1 GB num sistema que precisa ir embarcado |
+| **PaddleOCR em runtime** | Tenta baixar modelo na inicialização mesmo com cache local, e arrasta PaddleX inteiro. É a razão de existir da fronteira acima |
+
 ```
 siamac-container/
 ├─ pyproject.toml                 # uv / hatchling
