@@ -119,8 +119,9 @@ A ──────► B ──────► D
 
 - [x] **B1** Auditar datasets públicos → *ver §7*
 - [ ] **B2** Gerar 50–100 mil sintéticos (códigos válidos + degradação)
+- [ ] **B2b** Preparar o TRUDI: filtrar famílias, converter MMOCR → TSV (§7.1) — *depende da decisão de licença*
 - [ ] **B3** Dicionário de 36 caracteres + config de `configs/rec/`
-- [ ] **B4** Treinar modelo **v0** → exportar ONNX
+- [ ] **B4** Treinar modelo **v0** (sintéticos + TRUDI) → exportar ONNX
 - [ ] **B5** `siamac-recorder` — gravador autônomo
 - [ ] **B6** **Coleta em campo** (~5.000 imagens, automática)
 - [ ] **B7** Anotação incremental + fine-tune + avaliação
@@ -152,7 +153,7 @@ A ──────► B ──────► D
 |---|---|
 | **Semana 1** (31/ago) | Resolver câmeras · comprar · perguntas ao responsável · baixar tudo · esqueleto |
 | **Semanas 2–3** | **Kit de campo:** `recorder`, `aim`, `daily_report` · ISO 6346 · captura RTSP |
-| **Semana 4** | Sintéticos · modelo v0 · **teste de bancada** · **enviar câmeras** |
+| **Semana 4** | Sintéticos + TRUDI · modelo v0 · **teste de bancada** · **enviar câmeras** |
 | **Semana 5** | Pipeline · API · serviço Windows · instalador |
 | **Outubro** | Instalação (2 dias) + coleta automática (~15 min/dia) |
 | **Novembro** | Anotar · treinar · avaliar |
@@ -221,7 +222,13 @@ Os casos difíceis estão **deliberadamente sobre-representados**: se 5% dos cas
 
 ### Pipeline de treino
 
-**Reconhecedor:** sintéticos (50–100 mil, grátis, transcrição perfeita) → fine-tune com recortes reais → realimentação com as correções manuais da API.
+**Reconhecedor, em três camadas:**
+
+1. **Sintéticos** — 50–100 mil, grátis, transcrição perfeita por construção
+2. **TRUDI** — ~3.100 recortes reais com transcrição (§7.1), *sujeito à decisão de licença*
+3. **Nossos dados** — fine-tune final com os recortes da portaria, depois realimentado pelas correções manuais da API
+
+As duas primeiras camadas produzem o **modelo v0** que viaja com você. A terceira é a que leva o sistema a 90–97%.
 
 ---
 
@@ -283,6 +290,11 @@ Recortes de palavra **com transcrição**, formato MMOCR `TextRecogDataset`. Bai
 2. **As portas ficam sempre voltadas para trás?** → decide se a lateral de leitura é obrigatória
 3. **Existe link de internet no local?** → ⚠️ *"offline" é o software; a VPN precisa de link.* Sem ele, o comissionamento exige segunda viagem
 4. **O sistema principal exporta o log de entradas digitadas?** → decide se a anotação custa 6 h ou 21 h
+
+**Decidir internamente na empresa:**
+
+5. **Licença CC BY-SA 4.0 do TRUDI** → o ShareAlike é compatível com o produto comercial fechado? **Vale ~3.100 amostras reais** (§7.1). Se vetado, o v0 depende só dos sintéticos e cai de ~80% para ~60–70%
+6. **Licença do detector** — Ultralytics é AGPL-3.0; usar YOLOX ou RT-DETR. Só relevante se subir ao degrau 2
 
 **Também na semana 1:** distância em cabo até o PC (⚠️ **PoE tem limite de 100 m**) · energia e aterramento · autorização para furar · escada ou plataforma · EPI e integração de segurança · endereço de entrega das câmeras
 
