@@ -159,7 +159,7 @@ A ──────► B ──────► D
 - [ ] **B3** Dicionário de 36 caracteres + config de `configs/rec/`
 - [ ] **B4** Treinar modelo **v0** (sintéticos + TRUDI) → exportar ONNX
 - [ ] **B5** `siamac-recorder` — gravador autônomo
-- [ ] **B6** **Coleta em campo** (~5.000 imagens, automática)
+- [ ] **B6** **Coleta em campo** — todos os eventos das 2 semanas, automática
 - [ ] **B7** Anotação incremental + fine-tune + avaliação
 
 ### 🅲 Aplicação · *30%*
@@ -222,23 +222,51 @@ Verificação diária pelo relatório · coleta deliberada dos casos difíceis: 
 
 **Coletar ≠ anotar.** A coleta é automática e gratuita; a anotação é que custa. Colete tudo, anote com critério.
 
-### Coletar ~5.000, anotar de forma incremental
+### ⚠️ Só a 4K gera dado de treino
 
-**Colete as ~5.000** (o `recorder` faz sozinho, custa zero) — o excedente é o que permite *escolher* as melhores, em vez de aceitar as que sobraram.
+As PAN entregam 20 px/caractere — treinar com elas ensinaria o reconhecedor a partir de imagens ilegíveis. **O dataset sai de uma câmera só.** As laterais geram evidência do evento, não dado de treino.
 
-**Anote em rodadas:**
+Isso muda a aritmética:
 
 ```
-Anote 2.000 → treine → meça → só anote mais se o número exigir
+volume da portaria × 14 dias = N eventos
+        ↓
+   N contêineres distintos          ← o número que importa
+        ↓
+   × 2–3 frames úteis da 4K
+        ↓
+   = dataset de treino
+```
+
+Com ~100 caminhões/dia: **1.400 eventos → 2.800 a 4.200 imagens de 1.400 contêineres distintos.**
+
+> **A meta se expressa em eventos, não em imagens:** colete todos os eventos das duas semanas, anote 2–3 frames da 4K de cada. O número final sai do que a portaria oferece, não de uma meta arbitrária.
+>
+> E **2.800 imagens de 1.400 contêineres valem mais que 5.000 de 500** — a diversidade vem do número de eventos.
+
+### O que coletar
+
+| Fonte | O que gravar | Para quê |
+|---|---|---|
+| **4K do fundo** | Todos os eventos, 5 frames cada | **Dado de treino** |
+| 2 PAN laterais | 1 snapshot por evento | Evidência; custa pouco disco |
+| Todas | Timelapse de 30 s | Rede de segurança (~6 GB) |
+
+Fora: vídeo contínuo 24/7 pelas duas semanas — centenas de GB para cobrir um risco pequeno.
+
+### Anotação incremental
+
+```
+Anote 1.000 → treine → meça → só anote mais se o número exigir
 ```
 
 Se precisar de mais, **anote 500 direcionadas aos casos onde o modelo errou** — valem mais que 2.000 aleatórias.
 
 ### Critérios
 
-**Diversidade acima de volume.** Na primeira rodada: 2.000 imagens de **~670 contêineres distintos** (3 câmeras por evento). Se o conjunto crescer para 5.000, ~1.700 contêineres. O que não pode acontecer é 2.000 imagens de 200 contêineres.
+**Diversidade vem dos eventos.** Anotar 2 frames de 1.400 eventos é muito melhor que 10 frames de 280. Varie proprietário, cor, estado de conservação e tipo de contêiner.
 
-Varie proprietário, cor, estado de conservação e tipo.
+⚠️ **Se o volume da portaria for baixo** (40/dia → só 560 eventos em 2 semanas), o dataset fica curto. Nesse caso a Regra 4 abaixo — o `recorder` seguir rodando após a partida — deixa de ser conveniência e vira necessidade.
 
 **Estratificar por luz, não por horário:**
 
@@ -255,12 +283,12 @@ Os casos difíceis estão **deliberadamente sobre-representados** em relação �
 
 ### Custo da anotação
 
-| Modo | 2.000 (1ª rodada) | 5.000 (completo) |
+| Modo | 1.000 (1ª rodada) | ~3.000 (dataset típico) |
 |---|---|---|
-| Caixa + transcrição manual | ~8 h | ~21 h |
-| **Com o log do sistema principal** | **~2,5 h** | **~6 h** |
+| Caixa + transcrição manual | ~4 h | ~13 h |
+| **Com o log do sistema principal** | **~1,5 h** | **~4 h** |
 
-⭐ Se o sistema principal registra a entrada digitada pelo porteiro, esse log casado por timestamp entrega a transcrição pronta. **Vale 15 horas de trabalho manual** — e nesse cenário anotar as 5.000 fica tão barato que a estratégia incremental perde importância.
+⭐ Se o sistema principal registra a entrada digitada pelo porteiro, esse log casado por timestamp entrega a transcrição pronta. **Vale ~9 horas de trabalho manual** — e nesse cenário anotar o conjunto inteiro fica tão barato que a estratégia incremental perde importância.
 
 ### Pipeline de treino
 
@@ -449,7 +477,7 @@ Registradas para não serem reabertas sem contexto.
 
 ## Resumo
 
-**Trocar complexidade de software por volume de dados:** coletar ~5.000 imagens reais e manter o sistema em sete módulos simples.
+**Trocar complexidade de software por volume de dados:** coletar todos os eventos das duas semanas e manter o sistema em sete módulos simples.
 
 **A viagem entrega instalação correta e dataset — não sistema funcionando.** Isso vem depois, pela VPN.
 
