@@ -22,16 +22,25 @@ Sistema que lê automaticamente o código ISO 6346 de contêineres sobre caminh�
       ↓
 Gatilho  (chamada do sistema principal, ou movimento)
       ↓
-Captura de N frames por câmera
-      ↓
-Recorte da região do código        ← ROI configurada, não modelo treinado
-      ↓
-PP-OCR no recorte                  → texto + confiança
-      ↓
-Validação ISO 6346                 → check digit + correção posicional
-      ↓
-Maior confiança entre as câmeras   → SQLite → API HTTP → sistema principal
+   ┌──────────────────────────┬────────────────────────────┐
+   │  4K do fundo             │  2 laterais (VIP 5180 PAN) │
+   │  ↓                       │  ↓                         │
+   │  N frames                │  1 snapshot cada           │
+   │  ↓                       │  ↓                         │
+   │  Recorte da ROI          │  evidência do evento       │
+   │  ↓                       │  (não passam por OCR)      │
+   │  PP-OCR                  │                            │
+   │  ↓                       │                            │
+   │  Validação ISO 6346      │                            │
+   └──────────┬───────────────┴──────────────┬─────────────┘
+              └────────► SQLite ◄────────────┘
+                            ↓
+                  API HTTP → sistema principal
 ```
+
+**Uma câmera lê; duas registram.** A leitura vem só da 4K do fundo — as PAN entregam 20 px/caractere e não leem em configuração nenhuma. Elas contribuem com **evidência visual do evento** (conferência manual, resolução de disputas) e **gatilho por movimento**.
+
+⚠️ **Consequência a ter clara:** as laterais **não são redundância de leitura**. Se a porta falhar — suja, ocluída, virada, caminhão torto —, elas registram a imagem mas não salvam a leitura. O evento vai para `NEEDS_REVIEW` com as fotos, e o operador digita.
 
 **Sete módulos:** `capture` · `roi` · `ocr` · `iso6346` · `api` · `db` · `service`
 
@@ -55,9 +64,10 @@ Comece no degrau 1. **Suba apenas quando uma medição mostrar que é necessári
 |---|---|---|
 | **1** | **Porta + ROI + PP-OCR + ISO 6346** | *(ponto de partida)* |
 | 2 | Detector YOLO de região | A ROI fixa erra: caminhão fora de posição, 20' e 40' em alturas diferentes |
-| 3 | Câmera lateral de 8 MP | A porta falha: virada, suja, ocluída |
-| 4 | Fusão entre câmeras | Duas câmeras leem e discordam |
-| 5 | *Beam search* com top-K | O OCR erra por 1 caractere de forma recorrente |
+| 3 | *Beam search* com top-K | O OCR erra por 1 caractere de forma recorrente |
+| 4 | 4ª câmera lateral com leitura real | Muitos eventos com a porta ilegível (virada, suja, ocluída) — **decisão de hardware, com custo** |
+
+*A fusão entre câmeras saiu da escada:* só faria sentido com duas câmeras lendo, o que o arranjo de 3 não prevê. Se o degrau 4 for acionado algum dia, ela volta a ser considerada.
 
 ---
 
@@ -79,13 +89,9 @@ px/caractere = 0,10 m ÷ (2 × distância × tan(AFOV_vertical ÷ 2)) × altura_
 |---|---|---|---|
 | Lateral esquerda | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
 | Lateral direita | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
-| **Fundo (portas)** | **4K / 8 MP** — modelo a definir | ⭐ **Leitura primária** | ✅ Folga confortável — ver abaixo |
+| **Fundo (portas)** | **4K / 8 MP** — modelo a definir | ⭐ **Única câmera de leitura** | ✅ Folga confortável — ver abaixo |
 
-**Possível 4ª câmera — decidir após a pergunta 2 do §8:**
-
-| Posição | Especificação | Quando é necessária |
-|---|---|---|
-| Uma lateral, com leitura real | 8 MP + 2,8 mm a ~6 m → 34 px | Se as portas **não** ficarem sempre voltadas para trás. Recomendada mesmo no caso favorável: depender de uma única face é frágil |
+**Arranjo fechado em 3 câmeras.** Uma lê, duas registram.
 
 **VIP 5180 PAN FT** — 4 MP (2880×1620), lente 2,1 mm, **180° H / 78° V** → 20,8 px/grau.
 A 6 m entrega 20 px no centro e ~10 px nas bordas. Zoom digital não ajuda (é recorte, não cria pixels). **Permanece no projeto como câmera de contexto e gatilho, funções em que é boa.**
@@ -366,11 +372,10 @@ Distribuídas em ~14 semanas de calendário (set/2026 → dez/2026), com dedica�
 | Item | Estimativa |
 |---|---|
 | Câmera do fundo — **4K / 8 MP** | R$ 1.500 – 3.000 |
-| Lateral de leitura 8 MP *(se necessária)* | R$ 1.500 – 2.500 |
 | PC | R$ 4.000 – 8.000 |
 | Switch PoE, cabos, acessórios | R$ 1.000 – 2.000 |
 | HD externo 2 TB, nobreak | R$ 1.000 – 1.500 |
-| **Total** | **R$ 8.300 – 15.500** |
+| **Total** | **R$ 7.500 – 14.500** |
 
 *Valores de referência para agosto/2026 — cotar antes de fechar.*
 
@@ -381,7 +386,7 @@ Distribuídas em ~14 semanas de calendário (set/2026 → dez/2026), com dedica�
 **Perguntar ao responsável — hoje ou amanhã:**
 
 1. **Modelo exato da 4K do fundo** → verificar os 4 pontos do §3, sobretudo o **desempenho noturno** (sensor, Starlight, lux). A distância deixou de ser risco nesta posição, mas a leitura com IR ainda não está garantida
-2. **As portas ficam sempre voltadas para trás?** → decide se a lateral de leitura é obrigatória
+2. **As portas ficam sempre voltadas para trás?** → com uma única câmera de leitura, define **quantos eventos o sistema simplesmente não conseguirá ler**. Se a orientação variar bastante, esses casos vão todos para digitação manual — e a meta de auto-aceite (§9) precisa ser revista para baixo
 3. **Existe link de internet no local?** → ⚠️ *"offline" é o software; a VPN precisa de link.* Sem ele, o comissionamento exige segunda viagem
 4. **O sistema principal exporta o log de entradas digitadas?** → decide se a anotação custa 6 h ou 21 h
 
