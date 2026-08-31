@@ -79,7 +79,7 @@ px/caractere = 0,10 m ÷ (2 × distância × tan(AFOV_vertical ÷ 2)) × altura_
 |---|---|---|---|
 | Lateral esquerda | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
 | Lateral direita | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
-| **Portas** | **VIP 3230 SL G3** (a confirmar) | ⭐ **Leitura primária** | ✅ Serve **se a 2–3,5 m** |
+| **Fundo (portas)** | ⭐ **VIP 5440 IA — lente 3,6 mm** *(recomendada)* | ⭐ **Leitura primária** | ✅ Serve de **2,5 a 6 m** |
 
 **Possível 4ª câmera — decidir após a pergunta 2 do §8:**
 
@@ -90,9 +90,31 @@ px/caractere = 0,10 m ÷ (2 × distância × tan(AFOV_vertical ÷ 2)) × altura_
 **VIP 5180 PAN FT** — 4 MP (2880×1620), lente 2,1 mm, **180° H / 78° V** → 20,8 px/grau.
 A 6 m entrega 20 px no centro e ~10 px nas bordas. Zoom digital não ajuda (é recorte, não cria pixels). **Permanece no projeto como câmera de contexto e gatilho, funções em que é boa.**
 
-**VIP 3230 SL G3** — 2 MP (1920×1080), lente 2,8 mm, 107° H / 56° V → 19,3 px/grau.
-Na porta: 44 px a 2,5 m · 37 px a 3 m · **32 px a 3,5 m (limite)** · 28 px a 4 m ❌
-A favor: **Starlight F1.6 (0,005 Lux)** — a leitura noturna é 25% do dataset. Contra: sem margem, e 2 MP não permite recorte digital.
+#### ⭐ A câmera do fundo — comparação
+
+| | VIP 3230 SL G3 | **VIP 5440 IA (3,6 mm)** |
+|---|---|---|
+| Resolução | 2 MP (1920×1080) | **4 MP (2688×1520)** |
+| AFOV vertical | 56° | **44°** |
+| **Resolução angular** | 19,3 px/grau | **34,5 px/grau** |
+| Sensor | Starlight | **Starlight** |
+| IR | 30 m | **40 m** |
+
+| Distância | 3230 SL G3 | **5440 IA 3,6 mm** |
+|---|---|---|
+| 2,5 m | 44 px ✓ | **79 px** ✓✓✓ |
+| 3 m | 37 px ✓ | **66 px** ✓✓✓ |
+| 3,5 m | 32 px ⚠️ | **57 px** ✓✓ |
+| 4 m | 28 px ❌ | **49 px** ✓✓ |
+| 5 m | 22 px ❌ | **40 px** ✓✓ |
+| 6 m | 18 px ❌ | **33 px** ✓ |
+| 7 m | 15 px ❌ | 28 px ⚠️ |
+
+> **Recomendação: VIP 5440 IA, lente 3,6 mm.** A 3230 serve só até 3,5 m; a 5440 cobre de 2,5 a 6 m — **elimina a dependência de acertar a distância**, que é o risco criado pela lente fixa. Como a distância disponível ainda é desconhecida (pergunta 1 do §8), essa margem é o que evita comprar errado.
+
+**Ganhos adicionais:** 4 MP permite **recorte digital** se o enquadramento sair torto (2 MP não deixa margem) · **IA embarcada com detecção de veículo** pode servir de gatilho por hardware, dispensando a heurística de movimento no nosso código · IR de 40 m com o mesmo Starlight.
+
+⚠️ **Na compra, exigir a versão de lente 3,6 mm.** A VIP 5440 IA também sai com 2,8 mm, que entrega só 25,8 px/grau (25 px a 6 m) — a diferença **não aparece no nome do modelo**. Enquadramento: 88° horizontais cobrem 7,7 m a 4 m; a porta tem 2,44 m, com folga confortável.
 
 ### Levar na mala
 
@@ -343,7 +365,7 @@ Distribuídas em ~14 semanas de calendário (set/2026 → dez/2026), com dedica�
 
 | Item | Estimativa |
 |---|---|
-| Câmera das portas | R$ 800 – 1.500 |
+| Câmera do fundo — **VIP 5440 IA, lente 3,6 mm** | R$ 1.500 – 2.500 |
 | Lateral de leitura 8 MP *(se necessária)* | R$ 1.500 – 2.500 |
 | PC | R$ 4.000 – 8.000 |
 | Switch PoE, cabos, acessórios | R$ 1.000 – 2.000 |
@@ -358,7 +380,7 @@ Distribuídas em ~14 semanas de calendário (set/2026 → dez/2026), com dedica�
 
 **Perguntar ao responsável — hoje ou amanhã:**
 
-1. **Distância disponível para a câmera das portas** → decide se a VIP 3230 SL G3 serve
+1. **Distância disponível para a câmera do fundo** → a VIP 5440 IA (3,6 mm) cobre 2,5–6 m; confirmar que a distância cai nessa faixa
 2. **As portas ficam sempre voltadas para trás?** → decide se a lateral de leitura é obrigatória
 3. **Existe link de internet no local?** → ⚠️ *"offline" é o software; a VPN precisa de link.* Sem ele, o comissionamento exige segunda viagem
 4. **O sistema principal exporta o log de entradas digitadas?** → decide se a anotação custa 6 h ou 21 h
