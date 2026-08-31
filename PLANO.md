@@ -73,11 +73,19 @@ px/caractere = 0,10 m ÷ (2 × distância × tan(AFOV_vertical ÷ 2)) × altura_
 
 ### Situação das câmeras
 
-| Câmera | Modelo | Papel | Veredito |
+**As 3 câmeras do projeto:**
+
+| Posição | Modelo | Papel | Veredito |
 |---|---|---|---|
-| Laterais (2×) | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
-| Portas | **VIP 3230 SL G3** (avaliar) | **Leitura primária** | ✅ Serve **se a 2–3,5 m** |
-| Lateral de leitura | a definir | Redundância | 8 MP + 2,8 mm a ~6 m → 34 px |
+| Lateral esquerda | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
+| Lateral direita | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
+| **Portas** | **VIP 3230 SL G3** (a confirmar) | ⭐ **Leitura primária** | ✅ Serve **se a 2–3,5 m** |
+
+**Possível 4ª câmera — decidir após a pergunta 2 do §8:**
+
+| Posição | Especificação | Quando é necessária |
+|---|---|---|
+| Uma lateral, com leitura real | 8 MP + 2,8 mm a ~6 m → 34 px | Se as portas **não** ficarem sempre voltadas para trás. Recomendada mesmo no caso favorável: depender de uma única face é frágil |
 
 **VIP 5180 PAN FT** — 4 MP (2880×1620), lente 2,1 mm, **180° H / 78° V** → 20,8 px/grau.
 A 6 m entrega 20 px no centro e ~10 px nas bordas. Zoom digital não ajuda (é recorte, não cria pixels). **Permanece no projeto como câmera de contexto e gatilho, funções em que é boa.**
@@ -186,7 +194,11 @@ Verificação diária pelo relatório · coleta deliberada dos casos difíceis: 
 
 **Coletar ≠ anotar.** A coleta é automática e gratuita; a anotação é que custa. Colete tudo, anote com critério.
 
-### Anotação incremental — não fixe o número
+### Coletar ~5.000, anotar de forma incremental
+
+**Colete as ~5.000** (o `recorder` faz sozinho, custa zero) — o excedente é o que permite *escolher* as melhores, em vez de aceitar as que sobraram.
+
+**Anote em rodadas:**
 
 ```
 Anote 2.000 → treine → meça → só anote mais se o número exigir
@@ -196,7 +208,9 @@ Se precisar de mais, **anote 500 direcionadas aos casos onde o modelo errou** �
 
 ### Critérios
 
-**Diversidade acima de volume:** 5.000 imagens de ~1.700 contêineres distintos, não de 300. Varie proprietário, cor, estado de conservação e tipo.
+**Diversidade acima de volume.** Na primeira rodada: 2.000 imagens de **~670 contêineres distintos** (3 câmeras por evento). Se o conjunto crescer para 5.000, ~1.700 contêineres. O que não pode acontecer é 2.000 imagens de 200 contêineres.
+
+Varie proprietário, cor, estado de conservação e tipo.
 
 **Estratificar por luz, não por horário:**
 
@@ -209,16 +223,16 @@ Se precisar de mais, **anote 500 direcionadas aos casos onde o modelo errou** �
 | Chuva | 10% | |
 | **Casos especiais** | 10% | Repintado, sujo, duplo 20', oclusão |
 
-Os casos difíceis estão **deliberadamente sobre-representados**: se 5% dos casos reais são noturnos com chuva e você anotar 5%, o modelo vê 250 exemplos — pouco para aprender.
+Os casos difíceis estão **deliberadamente sobre-representados** em relação à frequência real: se apenas 5% dos casos são noturnos com chuva e você anotar 5%, o modelo vê exemplos demais de menos para aprender.
 
 ### Custo da anotação
 
-| Modo | 5.000 imagens |
-|---|---|
-| Caixa + transcrição manual | ~21 h |
-| **Com o log do sistema principal** | **~6 h** |
+| Modo | 2.000 (1ª rodada) | 5.000 (completo) |
+|---|---|---|
+| Caixa + transcrição manual | ~8 h | ~21 h |
+| **Com o log do sistema principal** | **~2,5 h** | **~6 h** |
 
-⭐ Se o sistema principal registra a entrada digitada pelo porteiro, esse log casado por timestamp entrega a transcrição pronta. **Vale 15 horas de trabalho manual.**
+⭐ Se o sistema principal registra a entrada digitada pelo porteiro, esse log casado por timestamp entrega a transcrição pronta. **Vale 15 horas de trabalho manual** — e nesse cenário anotar as 5.000 fica tão barato que a estratégia incremental perde importância.
 
 ### Pipeline de treino
 
@@ -279,6 +293,64 @@ Recortes de palavra **com transcrição**, formato MMOCR `TextRecogDataset`. Bai
 ⚠️ **Há recortes com AR < 1 — texto vertical**, o código empilhado na porta. Confirma que o pré-processamento não pode assumir texto horizontal.
 
 **Impacto na estimativa do v0:** de 60–80% para **75–85%**. O destino não muda; a linha de partida sim — e um v0 melhor torna o gate do dia 3 mais conclusivo.
+
+---
+
+## 7.2 Dimensionamento
+
+### O produto entregue
+
+| | |
+|---|---|
+| **Instalador** (Inno Setup, LZMA2) | **~120 MB** |
+| Instalado em disco | ~250 MB |
+| Composição | OpenCV 50 · modelos ONNX 55 · NumPy 25 · Python 20 · FastAPI e resto 35 · VC++ 25 |
+
+Com GPU: DirectML soma ~40 MB; **CUDA somaria ~1 GB** (DLLs do provider precisam ir junto num sistema offline). **Se precisar de GPU, DirectML.**
+
+### Crescimento em operação — ~100 caminhões/dia
+
+| | Por dia | Por mês |
+|---|---|---|
+| Banco SQLite | ~200 KB | ~6 MB |
+| **Imagens de evidência** | ~350 MB | **~10,5 GB** |
+
+**Com retenção de 30 dias, estabiliza em ~11 GB.** Sem retenção: ~128 GB/ano até o disco encher e o serviço parar — por isso a política de retenção é obrigatória desde o dia 1, não refinamento posterior.
+
+### Espaço necessário
+
+| Onde | Quanto |
+|---|---|
+| PC do cliente | ~11 GB estáveis (SSD de 512 GB é folgado) |
+| PC do local, durante a coleta | ~105–150 GB |
+| **Sua máquina de desenvolvimento** | **reservar ~200 GB** — dados da viagem, sintéticos, checkpoints de treino |
+
+## 7.3 Esforço estimado
+
+⚠️ *Estimativas para calibrar expectativa, não compromisso.*
+
+| Bloco | % | Horas |
+|---|---|---|
+| A — Hardware e Instalação | 15% | 55–70 h |
+| **B — Dados e Modelo** | **40%** | **140–180 h** |
+| C — Aplicação | 30% | 105–135 h |
+| D — Entrega e Operação | 15% | 55–70 h |
+| **Total** | | **~355–455 h** |
+
+Distribuídas em ~14 semanas de calendário (set/2026 → dez/2026), com dedicação parcial.
+
+### Hardware a adquirir (fora as 2 VIP 5180 PAN já compradas)
+
+| Item | Estimativa |
+|---|---|
+| Câmera das portas | R$ 800 – 1.500 |
+| Lateral de leitura 8 MP *(se necessária)* | R$ 1.500 – 2.500 |
+| PC | R$ 4.000 – 8.000 |
+| Switch PoE, cabos, acessórios | R$ 1.000 – 2.000 |
+| HD externo 2 TB, nobreak | R$ 1.000 – 1.500 |
+| **Total** | **R$ 8.300 – 15.500** |
+
+*Valores de referência para agosto/2026 — cotar antes de fechar.*
 
 ---
 
