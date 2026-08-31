@@ -1,0 +1,316 @@
+# SiamacContainer — Leitura Automática de Código de Contêiner
+
+**Repositório:** `jobvictorfern-cmd/SiamacContainer` (vazio — projeto novo)
+**Data:** 31/08/2026 · **Viagem de instalação:** outubro/2026 · **Produção:** dezembro/2026
+
+---
+
+## 1. O que é
+
+Sistema que lê automaticamente o código ISO 6346 de contêineres sobre caminhão, na portaria, usando 3 câmeras IP. Roda como serviço Windows, **100% offline**, e entrega o resultado ao sistema principal por HTTP. Permite correção manual pela API quando a leitura sai errada.
+
+**A restrição que organiza tudo:** há uma janela de **2 semanas no local, em outubro, com dedicação parcial**. Depois dela, o acesso é apenas remoto por VPN.
+
+**Por isso a viagem tem um objetivo só:** deixar a instalação física correta e voltar com um bom conjunto de imagens. O sistema funcionando é consequência do trabalho remoto que vem depois.
+
+---
+
+## 2. Como funciona
+
+```
+3 câmeras RTSP
+      ↓
+Gatilho  (chamada do sistema principal, ou movimento)
+      ↓
+Captura de N frames por câmera
+      ↓
+Recorte da região do código        ← ROI configurada, não modelo treinado
+      ↓
+PP-OCR no recorte                  → texto + confiança
+      ↓
+Validação ISO 6346                 → check digit + correção posicional
+      ↓
+Maior confiança entre as câmeras   → SQLite → API HTTP → sistema principal
+```
+
+**Sete módulos:** `capture` · `roi` · `ocr` · `iso6346` · `api` · `db` · `service`
+
+### Decisões-chave
+
+| Decisão | Motivo |
+|---|---|
+| **Python 3.12 + ONNX Runtime** | ONNX roda os modelos sem PaddlePaddle nem PaddleX no cliente: instalador ~10× menor, sem conflito de DLL, boot rápido |
+| **Treinar com PaddleOCR, rodar com ONNX** | O PaddleOCR 3.x **falha ao iniciar offline** mesmo com cache local (tenta HuggingFace/ModelScope antes). Nunca entra no produto |
+| **A porta é a face principal de leitura** | Entrega 50–89 px/caractere contra 34 px de uma lateral; superfície plana, estreita (2,44 m), distância uniforme |
+| **Recorte configurado, sem detector treinado** | A câmera é fixa e o caminhão para na linha marcada — a região é previsível. Elimina um modelo |
+| **Dicionário de 36 caracteres** (`A–Z`, `0–9`) | Reduz a camada de saída de milhares para 36 classes: modelo menor, mais rápido e mais preciso por construção |
+| **FastAPI + SQLite** | Zero administração, ideal para offline single-node; OpenAPI automática para a integração |
+| **Detector YOLO: YOLOX ou RT-DETR** | ⚠️ Ultralytics YOLO é **AGPL-3.0** — incompatível com produto comercial fechado |
+
+### A escada de complexidade
+
+Comece no degrau 1. **Suba apenas quando uma medição mostrar que é necessário** — nunca por antecipação. Cada degrau é código mantido para sempre.
+
+| | Adicionar | Sintoma que justifica |
+|---|---|---|
+| **1** | **Porta + ROI + PP-OCR + ISO 6346** | *(ponto de partida)* |
+| 2 | Detector YOLO de região | A ROI fixa erra: caminhão fora de posição, 20' e 40' em alturas diferentes |
+| 3 | Câmera lateral de 8 MP | A porta falha: virada, suja, ocluída |
+| 4 | Fusão entre câmeras | Duas câmeras leem e discordam |
+| 5 | *Beam search* com top-K | O OCR erra por 1 caractere de forma recorrente |
+
+---
+
+## 3. Hardware
+
+### A conta que decide tudo
+
+O critério não é megapixel, é **pixels de altura por caractere**. Caracteres do ISO 6346 têm 100 mm. **Meta: ≥30 px.**
+
+```
+px/caractere = 0,10 m ÷ (2 × distância × tan(AFOV_vertical ÷ 2)) × altura_do_sensor_px
+```
+
+### Situação das câmeras
+
+| Câmera | Modelo | Papel | Veredito |
+|---|---|---|---|
+| Laterais (2×) | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
+| Portas | **VIP 3230 SL G3** (avaliar) | **Leitura primária** | ✅ Serve **se a 2–3,5 m** |
+| Lateral de leitura | a definir | Redundância | 8 MP + 2,8 mm a ~6 m → 34 px |
+
+**VIP 5180 PAN FT** — 4 MP (2880×1620), lente 2,1 mm, **180° H / 78° V** → 20,8 px/grau.
+A 6 m entrega 20 px no centro e ~10 px nas bordas. Zoom digital não ajuda (é recorte, não cria pixels). **Permanece no projeto como câmera de contexto e gatilho, funções em que é boa.**
+
+**VIP 3230 SL G3** — 2 MP (1920×1080), lente 2,8 mm, 107° H / 56° V → 19,3 px/grau.
+Na porta: 44 px a 2,5 m · 37 px a 3 m · **32 px a 3,5 m (limite)** · 28 px a 4 m ❌
+A favor: **Starlight F1.6 (0,005 Lux)** — a leitura noturna é 25% do dataset. Contra: sem margem, e 2 MP não permite recorte digital.
+
+### Levar na mala
+
+PC preparado · switch PoE + reserva · cabos montados · RJ45, alicate, testador · **HD externo 2 TB** · pendrive com instalador · **trena a laser** · **alvo de calibração impresso, 2 cópias** · notebook · nobreak
+
+---
+
+## 4. Os quatro blocos
+
+```
+A ──────► B ──────► D
+          │         ▲
+          └──► C ───┘
+```
+
+**A trava tudo.** Sem câmera correta não há coleta; sem coleta não há modelo; sem modelo não há sistema.
+**C anda em paralelo com B** — a aplicação é construída contra o modelo v0 e só troca os `.onnx` depois.
+
+### 🅰 Hardware e Instalação · *15%*
+*Entregável: 3 câmeras instaladas com ≥30 px/caractere comprovado*
+
+- [ ] **A1** Resolver o arranjo de câmeras com o cliente
+- [ ] **A2** Comprar câmeras, switch PoE, acessórios
+- [ ] **A3** Preparar o PC (instalado, testado, software embarcado)
+- [ ] **A4** Confirmar autorizações e infraestrutura **por escrito**
+- [ ] **A5** Teste de bancada: RTSP, substream, alvo impresso aferido
+- [ ] **A6** Configurar (IP fixo, senha, hora), etiquetar (`ESQ`/`DIR`/`PORTAS`) e **enviar**
+- [ ] **A7** Instalação: **medir → conferir → furar**, nunca o contrário
+
+### 🅱 Dados e Modelo · *40% — o maior e mais incerto*
+*Entregável: modelos ONNX com acurácia medida no conjunto local*
+
+- [x] **B1** Auditar datasets públicos → *ver §7*
+- [ ] **B2** Gerar 50–100 mil sintéticos (códigos válidos + degradação)
+- [ ] **B3** Dicionário de 36 caracteres + config de `configs/rec/`
+- [ ] **B4** Treinar modelo **v0** → exportar ONNX
+- [ ] **B5** `siamac-recorder` — gravador autônomo
+- [ ] **B6** **Coleta em campo** (~5.000 imagens, automática)
+- [ ] **B7** Anotação incremental + fine-tune + avaliação
+
+### 🅲 Aplicação · *30%*
+*Entregável: serviço Windows funcional*
+
+- [ ] **C1** Esqueleto: config validada, logging, SQLite, Alembic
+- [ ] **C2** Núcleo ISO 6346 — check digit + correção posicional, 100% de cobertura
+- [ ] **C3** Captura RTSP com reconexão (contra MediaMTX)
+- [ ] **C4** Pipeline: recorte → OCR → validação
+- [ ] **C5** API HTTP + correção manual + webhook
+- [ ] **C6** Empacotamento PyInstaller + WinSW
+
+### 🅳 Entrega e Operação · *15%*
+*Entregável: sistema em produção com KPI medido*
+
+- [ ] **D1** Instalador Inno Setup + **teste da rede desligada**
+- [ ] **D2** Deploy do modelo treinado via VPN
+- [ ] **D3** Calibrar limiares **por medição**
+- [ ] **D4** Piloto em paralelo com a digitação manual
+- [ ] **D5** Medir KPIs e liberar o modo automático
+
+---
+
+## 5. Cronograma
+
+| Quando | Foco |
+|---|---|
+| **Semana 1** (31/ago) | Resolver câmeras · comprar · perguntas ao responsável · baixar tudo · esqueleto |
+| **Semanas 2–3** | **Kit de campo:** `recorder`, `aim`, `daily_report` · ISO 6346 · captura RTSP |
+| **Semana 4** | Sintéticos · modelo v0 · **teste de bancada** · **enviar câmeras** |
+| **Semana 5** | Pipeline · API · serviço Windows · instalador |
+| **Outubro** | Instalação (2 dias) + coleta automática (~15 min/dia) |
+| **Novembro** | Anotar · treinar · avaliar |
+| **Dezembro** | Deploy remoto · piloto assistido |
+
+### O kit de campo — as 3 ferramentas que decidem a viagem
+
+| | O quê | Sem ela |
+|---|---|---|
+| **`siamac-recorder`** | Grava sozinho por 13 dias: snapshots por evento (5 frames × 3 câmeras) + timelapse de 30 s como rede de segurança. ~105–150 GB no período | Você volta sem dataset |
+| **`siamac-aim`** | Mede px/caractere, nitidez e exposição ao vivo. Tem calculadora reversa: *"monte a câmera entre X e Y metros"*. **Roda antes de furar** | O enquadramento é chute e o erro só aparece na volta |
+| **`daily_report`** | 5 minutos por noite pela VPN: câmeras vivas, contagem de eventos, disco, miniaturas | Uma câmera cai no dia 3 e você descobre no dia 14 |
+
+### O roteiro da viagem
+
+**Dias 1–2 — instalação** *(os únicos dias de dedicação integral)*
+Levantamento → marcar a linha de parada → **aferir com o alvo impresso e o `aim`** → só então furar e montar → subir o `recorder` → **testar a VPN de dentro do local**
+
+**Dia 3 — GATE (2 horas)**
+Revisar as primeiras imagens · rodar o v0 · decidir se o enquadramento serve. **Sobram 11 dias para corrigir. Descobrir na volta é perder a viagem.**
+
+**Dias 4–14 — coleta autônoma** *(~15 min/dia)*
+Verificação diária pelo relatório · coleta deliberada dos casos difíceis: sol contra, chuva, contêiner repintado, duplo 20' e sobretudo a **transição dia↔noite** (a câmera troca o filtro IR-cut; é o pior caso e quase não aparece em amostragem aleatória)
+
+**Último dia** — conferir integridade dos dados no HD · fotografar a instalação · deixar o `recorder` rodando
+
+---
+
+## 6. Estratégia de dados
+
+**Coletar ≠ anotar.** A coleta é automática e gratuita; a anotação é que custa. Colete tudo, anote com critério.
+
+### Anotação incremental — não fixe o número
+
+```
+Anote 2.000 → treine → meça → só anote mais se o número exigir
+```
+
+Se precisar de mais, **anote 500 direcionadas aos casos onde o modelo errou** — valem mais que 2.000 aleatórias.
+
+### Critérios
+
+**Diversidade acima de volume:** 5.000 imagens de ~1.700 contêineres distintos, não de 300. Varie proprietário, cor, estado de conservação e tipo.
+
+**Estratificar por luz, não por horário:**
+
+| Condição | % | Observação |
+|---|---|---|
+| Dia, céu claro | 25% | O caso fácil |
+| Dia, nublado | 15% | |
+| **Sol direto / contraluz** | 15% | Sobre-representado de propósito |
+| **Noite com IR** | 25% | 25% da operação, se 24 h |
+| Chuva | 10% | |
+| **Casos especiais** | 10% | Repintado, sujo, duplo 20', oclusão |
+
+Os casos difíceis estão **deliberadamente sobre-representados**: se 5% dos casos reais são noturnos com chuva e você anotar 5%, o modelo vê 250 exemplos — pouco para aprender.
+
+### Custo da anotação
+
+| Modo | 5.000 imagens |
+|---|---|
+| Caixa + transcrição manual | ~21 h |
+| **Com o log do sistema principal** | **~6 h** |
+
+⭐ Se o sistema principal registra a entrada digitada pelo porteiro, esse log casado por timestamp entrega a transcrição pronta. **Vale 15 horas de trabalho manual.**
+
+### Pipeline de treino
+
+**Reconhecedor:** sintéticos (50–100 mil, grátis, transcrição perfeita) → fine-tune com recortes reais → realimentação com as correções manuais da API.
+
+---
+
+## 7. Recursos externos
+
+| Recurso | Situação |
+|---|---|
+| **PaddleOCR** (repo local, 3.7.x) | ✅ Essencial. Usar `ppocr/` + `tools/` + `configs/` para treinar. A API 3.x não entra no produto |
+| **`paddleocr-js`** | ⭐ Roda PP-OCRv5 em ONNX Runtime puro. **Ler antes de escrever nosso wrapper** — traz o pré/pós-processamento já isolado, que é onde a conversão para ONNX costuma falhar em silêncio |
+| **Pesos PP-OCR** (`det`, `rec`, `cls`) | 🔴 **Não vêm no repositório.** Baixar na semana 1 — sem eles não há ponto de partida para o treino |
+| Dataset Kaggle/Roboflow (`archive`) | 🟡 Uso marginal: o detector saiu da arquitetura. Serve para medir o baseline do PP-OCR (~1 dia) |
+| **TRUDI** (BMVC 2025) | 🟡 733 imagens, 35 mil instâncias, classe "ID text", validação ISO 6346. ⚠️ **CC BY-SA 4.0 — ShareAlike**, ambíguo para produto comercial fechado. Resolver antes de treinar |
+| Fontes OFL para sintéticos | 4–6 fontes condensadas e stencil |
+| MediaMTX + vídeos de contêiner | ⭐ Serve RTSP falso — **é o que permite desenvolver sem as câmeras** nas semanas 2–3 |
+| VC++ Redistributable | Embarcar no instalador; falta num Windows novo e derruba o serviço |
+
+**Regra:** nada baixa em runtime. Todo modelo, fonte e binário vai embarcado, com caminho absoluto vindo do `config.yaml`.
+
+---
+
+## 8. Pendências que travam o projeto
+
+**Perguntar ao responsável — hoje ou amanhã:**
+
+1. **Distância disponível para a câmera das portas** → decide se a VIP 3230 SL G3 serve
+2. **As portas ficam sempre voltadas para trás?** → decide se a lateral de leitura é obrigatória
+3. **Existe link de internet no local?** → ⚠️ *"offline" é o software; a VPN precisa de link.* Sem ele, o comissionamento exige segunda viagem
+4. **O sistema principal exporta o log de entradas digitadas?** → decide se a anotação custa 6 h ou 21 h
+
+**Também na semana 1:** distância em cabo até o PC (⚠️ **PoE tem limite de 100 m**) · energia e aterramento · autorização para furar · escada ou plataforma · EPI e integração de segurança · endereço de entrega das câmeras
+
+---
+
+## 9. Riscos
+
+| Risco | Mitigação |
+|---|---|
+| 🔴 **A câmera não lê** — confirmado na 5180 PAN | Volume de dados não corrige óptica. Depende de o cliente aprovar a câmera de leitura |
+| 🔴 **Voltar com dado inutilizável** | `aim` antes de furar · `daily_report` toda noite · **gate do dia 3** · timelapse redundante |
+| 🟠 **Erro silencioso** — pior que não ler | O check digit é `mod 11`: **~1 em 11 códigos errados passa por acaso**. Na dúvida, `NEEDS_REVIEW`. **KPI crítico: erro aceito sem aviso ≤ 0,5%** |
+| 🟠 **Licenças** | Ultralytics = AGPL · TRUDI = ShareAlike · Roboflow = verificar procedência. **Resolver antes de treinar** — corrigir depois significa retreinar do zero |
+| 🟠 **Bloqueio no dia 1** | Autorização, escada, tomada, EPI. Confirmar por escrito antes de viajar |
+| 🟡 **Cache não visível ao serviço** | Serviço Windows roda como `LocalSystem`, não vê `C:\Users\victo\.paddlex\`. Resolvido por ONNX com caminho absoluto |
+
+### Expectativa realista
+
+Sistemas comerciais consolidados atingem 95–99% em portaria com veículo parado. Um sistema próprio bem feito chega a **90–97%**. Prometer 99,9% é irrealista.
+
+**Metas a acordar:** auto-aceite correto ≥92% · **erro silencioso ≤0,5%** · resposta ≤3 s · disponibilidade ≥99%
+
+---
+
+## 10. Verificação
+
+**Testes automatizados** — `pytest` no ISO 6346 (vetores conhecidos e o caso `check digit 10 → 0`) · API com `httpx` (fluxo completo: evento → processa → corrige → webhook) · outbox com destino derrubado
+
+**End-to-end sem hardware** — MediaMTX servindo 3 vídeos como RTSP local; dispara evento, verifica resultado e webhook. Roda em CI, sem câmera
+
+**Antes de embarcar (inegociável)** — `recorder` gravando 24 h com corte de energia e de rede no meio · `aim` aferido contra medida real conhecida · `daily_report` acessado de fora da rede · os `.exe` em **Windows limpo, sem Python**
+
+**⭐ Teste da rede desligada** — instalar em Windows limpo **com a placa de rede desabilitada**, reiniciar, processar um evento ponta a ponta. Confirmar com `netstat -b` que nada tenta sair. ⚠️ Verificar com `pyi-archive_viewer` que **`paddle` e `paddleocr` não entraram no executável** — ler o código não basta, um import indireto entra sem aviso
+
+**Em produção** — soak de 72 h · piloto em paralelo com a digitação manual (mede a acurácia real sem risco) · reboot confirmando que o serviço sobe sozinho
+
+---
+
+## Anexo — Alternativas avaliadas e descartadas
+
+Registradas para não serem reabertas sem contexto.
+
+| Alternativa | Por que não |
+|---|---|
+| **Câmera com OCR embarcado** (VIDAR, Vaxtor) | Reduziria o prazo para ~8 semanas, mas **open source é exigência da empresa**. Nota: Intelbras/Hikvision/Dahua só fazem ANPR (placas), nunca ISO 6346 |
+| **YOLO lendo caracteres direto** (36 classes) | Anotação de **110 h** contra 21 h — o PP-OCR já vem pré-treinado. E YOLO também redimensiona: 34 px viram 6 px na imagem completa |
+| **OCR na imagem inteira, sem recorte** | Todo modelo redimensiona a entrada. `3840×2160 → 960×540` transforma 34 px em 8 px. Além disso a lateral tem `MAX GROSS`, `TARE`, logos — dezenas de strings sem indicar qual é o código |
+| **PaddleOCR em runtime no cliente** | Falha ao iniciar offline mesmo com cache; arrasta PaddleX inteiro. E o nosso modelo é treinado — não vem de cache nenhum |
+| **Vídeo contínuo 24/7 na coleta** | 227–453 GB para cobrir um risco pequeno. Substituído por timelapse de 30 s (~6 GB) |
+| **Refazer o split do dataset público** | O vazamento envenena a métrica *daquele* dataset — e a nossa régua é o conjunto de validação 100% local |
+
+---
+
+## Resumo
+
+**Trocar complexidade de software por volume de dados:** coletar ~5.000 imagens reais e manter o sistema em sete módulos simples.
+
+**A viagem entrega instalação correta e dataset — não sistema funcionando.** Isso vem depois, pela VPN.
+
+**Três ferramentas precisam estar prontas até outubro:** `recorder`, `aim`, `daily_report`.
+
+**Duas perguntas destravam a semana 1:** distância da câmera das portas, e orientação das portas.
+
+**A regra de ouro no local:** *medir com o alvo → conferir com o `aim` → só então furar.*
