@@ -233,12 +233,45 @@ Os casos difíceis estão **deliberadamente sobre-representados**: se 5% dos cas
 | **`paddleocr-js`** | ⭐ Roda PP-OCRv5 em ONNX Runtime puro. **Ler antes de escrever nosso wrapper** — traz o pré/pós-processamento já isolado, que é onde a conversão para ONNX costuma falhar em silêncio |
 | **Pesos PP-OCR** (`det`, `rec`, `cls`) | 🔴 **Não vêm no repositório.** Baixar na semana 1 — sem eles não há ponto de partida para o treino |
 | Dataset Kaggle/Roboflow (`archive`) | 🟡 Uso marginal: o detector saiu da arquitetura. Serve para medir o baseline do PP-OCR (~1 dia) |
-| **TRUDI** (BMVC 2025) | 🟡 733 imagens, 35 mil instâncias, classe "ID text", validação ISO 6346. ⚠️ **CC BY-SA 4.0 — ShareAlike**, ambíguo para produto comercial fechado. Resolver antes de treinar |
+| **TRUDI — `text_recognition`** (BMVC 2025) | ✅ **Auditado, e é bom.** Recortes **com transcrição**, formato MMOCR. Ver §7.1 · ⚠️ **CC BY-SA 4.0 — ShareAlike**: resolver com a empresa **antes de treinar** |
 | Fontes OFL para sintéticos | 4–6 fontes condensadas e stencil |
 | MediaMTX + vídeos de contêiner | ⭐ Serve RTSP falso — **é o que permite desenvolver sem as câmeras** nas semanas 2–3 |
 | VC++ Redistributable | Embarcar no instalador; falta num Windows novo e derruba o serviço |
 
 **Regra:** nada baixa em runtime. Todo modelo, fonte e binário vai embarcado, com caminho absoluto vindo do `config.yaml`.
+
+### 7.1 TRUDI `text_recognition` — auditado
+
+Recortes de palavra **com transcrição**, formato MMOCR `TextRecogDataset`. Baixar **só esta pasta** (47 MB) — as outras (`coco`, `labelme`, `yolo`, `text_detection`, 11 GB) são as mesmas imagens em outros formatos.
+
+```json
+{"instances": [{"text": "OOLU0208218"}], "img_path": "textrecog_imgs//0276_0.jpg"}
+```
+
+**O que serve** — dos 4.365 recortes de `both`:
+
+| Família | Qtd | |
+|---|---|---|
+| **Código ISO 6346** (`[A-Z]{4}\d{7}`) | **2.080** | ✅ o alvo |
+| **Size/type code** (`\d{2}[A-Z]\d`) | **1.026** | ✅ também no escopo |
+| Placa alemã (`HRO-M8006`) | 549 | ❌ filtrar |
+| Truncados e ruído (`45G`, `H`, `3`) | 680 | ❌ filtrar |
+
+**~3.100 amostras reais com transcrição** — cobre código e size/type.
+
+**Decisões antes de treinar:**
+
+1. **Ignorar `both`** — é cópia byte-a-byte de `aerial`+`ground` (~4,3 mil JPEGs redundantes)
+2. **Filtrar por família** — manter só ISO 6346 e size/type; descarta 29%
+3. **Dicionário sem hífen** (o hífen só existe por causa das placas) — mas **incluir o `J`**, que não aparece no dataset e é categoria válida do ISO 6346
+4. **Filtrar imagens < 16 px de altura** — há recortes de 6×6 px
+5. **Resize para altura 32** — a mediana do dataset é 35–46 px, bate com o padrão do PP-OCR sem upscale
+6. **Treinar com `aerial`+`ground`, validar em `ground`** — o aerial é drone (AR ~5); o ground (AR ~2,2) parece com a portaria
+7. **Converter MMOCR → PaddleOCR** (JSON → TSV `caminho⇥texto`), script de ~15 linhas
+
+⚠️ **Há recortes com AR < 1 — texto vertical**, o código empilhado na porta. Confirma que o pré-processamento não pode assumir texto horizontal.
+
+**Impacto na estimativa do v0:** de 60–80% para **75–85%**. O destino não muda; a linha de partida sim — e um v0 melhor torna o gate do dia 3 mais conclusivo.
 
 ---
 
