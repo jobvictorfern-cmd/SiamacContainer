@@ -1,488 +1,568 @@
 # SiamacContainer — Leitura Automática de Código de Contêiner
 
-**Repositório:** `jobvictorfern-cmd/SiamacContainer` (vazio — projeto novo)
-**Data:** 31/08/2026 · **Viagem de instalação:** outubro/2026 · **Produção:** dezembro/2026
+Planejamento escrito do zero a partir dos requisitos declarados, sem reaproveitar análise anterior. A versão anterior deste documento permanece recuperável no histórico do git (até o commit `5e9f603`).
 
 ---
 
-## 1. O que é
+## 1. Contexto
 
-Sistema que lê automaticamente o código ISO 6346 de contêineres sobre caminhão, na portaria, usando 3 câmeras IP. Roda como serviço Windows, **100% offline**, e entrega o resultado ao sistema principal por HTTP. Permite correção manual pela API quando a leitura sai errada.
+Hoje o código ISO 6346 dos contêineres que entram e saem é digitado manualmente na portaria. Digitação manual é lenta, gera erro de transcrição e não deixa evidência visual do que entrou.
 
-**A restrição que organiza tudo:** há uma janela de **2 semanas no local, em outubro, com dedicação parcial**. Depois dela, o acesso é apenas remoto por VPN.
+O objetivo é ler esse código automaticamente com câmeras já em posse, entregar o resultado ao sistema principal por API, e — quando a leitura não for confiável — deixar que um humano corrija sem travar a operação.
 
-**Por isso a viagem tem um objetivo só:** deixar a instalação física correta e voltar com um bom conjunto de imagens. O sistema funcionando é consequência do trabalho remoto que vem depois.
+**Resultado esperado:** ≥90% dos eventos lidos e aceitos automaticamente, com taxa de **erro silencioso** (código errado aceito sem aviso) abaixo de 0,5%. O resto vai para fila de revisão humana.
 
----
-
-## 2. Como funciona
-
-```
-3 câmeras RTSP
-      ↓
-Gatilho  (chamada do sistema principal, ou movimento)
-      ↓
-   ┌──────────────────────────┬────────────────────────────┐
-   │  4K do fundo             │  2 laterais (VIP 5180 PAN) │
-   │  ↓                       │  ↓                         │
-   │  N frames                │  1 snapshot cada           │
-   │  ↓                       │  ↓                         │
-   │  Recorte da ROI          │  evidência do evento       │
-   │  ↓                       │  (não passam por OCR)      │
-   │  PP-OCR                  │                            │
-   │  ↓                       │                            │
-   │  Validação ISO 6346      │                            │
-   └──────────┬───────────────┴──────────────┬─────────────┘
-              └────────► SQLite ◄────────────┘
-                            ↓
-                  API HTTP → sistema principal
-```
-
-**Uma câmera lê; duas registram.** A leitura vem só da 4K do fundo — as PAN entregam 20 px/caractere e não leem em configuração nenhuma. Elas contribuem com **evidência visual do evento** (conferência manual, resolução de disputas) e **gatilho por movimento**.
-
-⚠️ **Consequência a ter clara:** as laterais **não são redundância de leitura**. Se a porta falhar — suja, ocluída, virada, caminhão torto —, elas registram a imagem mas não salvam a leitura. O evento vai para `NEEDS_REVIEW` com as fotos, e o operador digita.
-
-**Sete módulos:** `capture` · `roi` · `ocr` · `iso6346` · `api` · `db` · `service`
-
-### Decisões-chave
-
-| Decisão | Motivo |
-|---|---|
-| **Python 3.12 + ONNX Runtime** | ONNX roda os modelos sem PaddlePaddle nem PaddleX no cliente: instalador ~10× menor, sem conflito de DLL, boot rápido |
-| **Treinar com PaddleOCR, rodar com ONNX** | O PaddleOCR 3.x **falha ao iniciar offline** mesmo com cache local (tenta HuggingFace/ModelScope antes). Nunca entra no produto |
-| **A porta é a face principal de leitura** | Entrega 50–89 px/caractere contra 34 px de uma lateral; superfície plana, estreita (2,44 m), distância uniforme |
-| **Recorte configurado, sem detector treinado** | A câmera é fixa e o caminhão para na linha marcada — a região é previsível. Elimina um modelo |
-| **Dicionário de 36 caracteres** (`A–Z`, `0–9`) | Reduz a camada de saída de milhares para 36 classes: modelo menor, mais rápido e mais preciso por construção |
-| **FastAPI + SQLite** | Zero administração, ideal para offline single-node; OpenAPI automática para a integração |
-| **Detector YOLO: YOLOX ou RT-DETR** | ⚠️ Ultralytics YOLO é **AGPL-3.0** — incompatível com produto comercial fechado |
-
-### A escada de complexidade
-
-Comece no degrau 1. **Suba apenas quando uma medição mostrar que é necessário** — nunca por antecipação. Cada degrau é código mantido para sempre.
-
-| | Adicionar | Sintoma que justifica |
-|---|---|---|
-| **1** | **Porta + ROI + PP-OCR + ISO 6346** | *(ponto de partida)* |
-| 2 | Detector YOLO de região | A ROI fixa erra: caminhão fora de posição, 20' e 40' em alturas diferentes |
-| 3 | *Beam search* com top-K | O OCR erra por 1 caractere de forma recorrente |
-| 4 | 4ª câmera lateral com leitura real | Muitos eventos com a porta ilegível (virada, suja, ocluída) — **decisão de hardware, com custo** |
-
-*A fusão entre câmeras saiu da escada:* só faria sentido com duas câmeras lendo, o que o arranjo de 3 não prevê. Se o degrau 4 for acionado algum dia, ela volta a ser considerada.
-
----
-
-## 3. Hardware
-
-### A conta que decide tudo
-
-O critério não é megapixel, é **pixels de altura por caractere**. Caracteres do ISO 6346 têm 100 mm. **Meta: ≥30 px.**
-
-```
-px/caractere = 0,10 m ÷ (2 × distância × tan(AFOV_vertical ÷ 2)) × altura_do_sensor_px
-```
-
-### Situação das câmeras
-
-**As 3 câmeras do projeto:**
-
-| Posição | Modelo | Papel | Veredito |
-|---|---|---|---|
-| Lateral esquerda | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
-| Lateral direita | **VIP 5180 PAN FT** ✅ comprada | Contexto, evidência, gatilho | ❌ **Não lê** — 20 px a 6 m |
-| **Fundo (portas)** | **4K / 8 MP** — modelo a definir | ⭐ **Única câmera de leitura** | ✅ Folga confortável — ver abaixo |
-
-**Arranjo fechado em 3 câmeras.** Uma lê, duas registram.
-
-**VIP 5180 PAN FT** — 4 MP (2880×1620), lente 2,1 mm, **180° H / 78° V** → 20,8 px/grau.
-A 6 m entrega 20 px no centro e ~10 px nas bordas. Zoom digital não ajuda (é recorte, não cria pixels). **Permanece no projeto como câmera de contexto e gatilho, funções em que é boa.**
-
-#### ⭐ A câmera do fundo — 4K, com folga
-
-Definida como **4K / 8 MP (3840×2160)**, modelo a confirmar. Resolve a leitura da porta com margem confortável:
-
-| Distância | 4K + 2,8 mm | 4K + 3,6 mm |
-|---|---|---|
-| 3 m | 70 px ✓✓✓ | 94 px ✓✓✓ |
-| 4 m | 52 px ✓✓ | 70 px ✓✓✓ |
-| 5 m | 42 px ✓✓ | 56 px ✓✓ |
-| 6 m | 35 px ✓ | 47 px ✓✓ |
-| 7 m | 30 px ✓ limite | 40 px ✓✓ |
-| 8 m | 26 px ❌ | 35 px ✓ |
-
-**Mesmo com a lente mais aberta cobre até 7 m** — a distância disponível deixa de ser risco nesta posição.
-
-**Quatro pontos a verificar quando o modelo for definido:**
-
-1. **Focal da lente** — se for 2,1 mm ou fisheye (AFOV vertical > 70°), recai no problema da 5180 PAN. Refazer a conta.
-2. ⚠️ **Desempenho noturno — a armadilha contra-intuitiva.** **4K nem sempre é melhor no escuro:** 8 MP num sensor 1/2.8" tem pixels *menores* que 4 MP no mesmo sensor, captando menos luz e gerando mais ruído. Como **25% do dataset é noturno com IR**, isso pesa. Verificar: tamanho do sensor (1/1.8" ≫ 1/2.8" para 4K), presença de **Starlight** e sensibilidade em lux (≤0,005 é bom). *Uma 4 MP Starlight pode ler melhor à noite que uma 4K comum.*
-3. **Alcance do IR** — 30 m ou mais para a distância prevista.
-4. **Taxa de quadros em 8 MP** — algumas 4K caem para 15 fps. Basta para veículo parado, mas três streams 4K consomem banda e CPU.
-
-> **O foco da verificação desloca-se de "resolução suficiente?" para "enxerga bem no escuro?".**
-
-*Referência, caso a 4K não se confirme:* **VIP 5440 IA com lente 3,6 mm** (4 MP, 34,5 px/grau, Starlight, IR 40 m) cobre de 2,5 a 6 m e é a alternativa recomendada. Exigir a versão **3,6 mm** — a mesma câmera também sai com 2,8 mm, que entrega só 25,8 px/grau, e a diferença não aparece no nome do modelo.
-
-### Levar na mala
-
-PC preparado · switch PoE + reserva · cabos montados · RJ45, alicate, testador · **HD externo 2 TB** · pendrive com instalador · **trena a laser** · **alvo de calibração impresso, 2 cópias** · notebook · nobreak
-
----
-
-## 4. Os quatro blocos
-
-```
-A ──────► B ──────► D
-          │         ▲
-          └──► C ───┘
-```
-
-**A trava tudo.** Sem câmera correta não há coleta; sem coleta não há modelo; sem modelo não há sistema.
-**C anda em paralelo com B** — a aplicação é construída contra o modelo v0 e só troca os `.onnx` depois.
-
-### 🅰 Hardware e Instalação · *15%*
-*Entregável: 3 câmeras instaladas com ≥30 px/caractere comprovado*
-
-- [ ] **A1** Resolver o arranjo de câmeras com o cliente
-- [ ] **A2** Comprar câmeras, switch PoE, acessórios
-- [ ] **A3** Preparar o PC (instalado, testado, software embarcado)
-- [ ] **A4** Confirmar autorizações e infraestrutura **por escrito**
-- [ ] **A5** Teste de bancada: RTSP, substream, alvo impresso aferido
-- [ ] **A6** Configurar (IP fixo, senha, hora), etiquetar (`ESQ`/`DIR`/`PORTAS`) e **enviar**
-- [ ] **A7** Instalação: **medir → conferir → furar**, nunca o contrário
-
-### 🅱 Dados e Modelo · *40% — o maior e mais incerto*
-*Entregável: modelos ONNX com acurácia medida no conjunto local*
-
-- [x] **B1** Auditar datasets públicos → *ver §7*
-- [ ] **B2** Gerar 50–100 mil sintéticos (códigos válidos + degradação)
-- [ ] **B2b** Preparar o TRUDI: filtrar famílias, converter MMOCR → TSV (§7.1) — *depende da decisão de licença*
-- [ ] **B3** Dicionário de 36 caracteres + config de `configs/rec/`
-- [ ] **B4** Treinar modelo **v0** (sintéticos + TRUDI) → exportar ONNX
-- [ ] **B5** `siamac-recorder` — gravador autônomo
-- [ ] **B6** **Coleta em campo** — todos os eventos das 2 semanas, automática
-- [ ] **B7** Anotação incremental + fine-tune + avaliação
-
-### 🅲 Aplicação · *30%*
-*Entregável: serviço Windows funcional*
-
-- [ ] **C1** Esqueleto: config validada, logging, SQLite, Alembic
-- [ ] **C2** Núcleo ISO 6346 — check digit + correção posicional, 100% de cobertura
-- [ ] **C3** Captura RTSP com reconexão (contra MediaMTX)
-- [ ] **C4** Pipeline: recorte → OCR → validação
-- [ ] **C5** API HTTP + correção manual + webhook
-- [ ] **C6** Empacotamento PyInstaller + WinSW
-
-### 🅳 Entrega e Operação · *15%*
-*Entregável: sistema em produção com KPI medido*
-
-- [ ] **D1** Instalador Inno Setup + **teste da rede desligada**
-- [ ] **D2** Deploy do modelo treinado via VPN
-- [ ] **D3** Calibrar limiares **por medição**
-- [ ] **D4** Piloto em paralelo com a digitação manual
-- [ ] **D5** Medir KPIs e liberar o modo automático
-
----
-
-## 5. Cronograma
-
-| Quando | Foco |
-|---|---|
-| **Semana 1** (31/ago) | Resolver câmeras · comprar · perguntas ao responsável · baixar tudo · esqueleto |
-| **Semanas 2–3** | **Kit de campo:** `recorder`, `aim`, `daily_report` · ISO 6346 · captura RTSP |
-| **Semana 4** | Sintéticos + TRUDI · modelo v0 · **teste de bancada** · **enviar câmeras** |
-| **Semana 5** | Pipeline · API · serviço Windows · instalador |
-| **Outubro** | Instalação (2 dias) + coleta automática (~15 min/dia) |
-| **Novembro** | Anotar · treinar · avaliar |
-| **Dezembro** | Deploy remoto · piloto assistido |
-
-### O kit de campo — as 3 ferramentas que decidem a viagem
-
-| | O quê | Sem ela |
-|---|---|---|
-| **`siamac-recorder`** | Grava sozinho por 13 dias: snapshots por evento (5 frames × 3 câmeras) + timelapse de 30 s como rede de segurança. ~105–150 GB no período | Você volta sem dataset |
-| **`siamac-aim`** | Mede px/caractere, nitidez e exposição ao vivo. Tem calculadora reversa: *"monte a câmera entre X e Y metros"*. **Roda antes de furar** | O enquadramento é chute e o erro só aparece na volta |
-| **`daily_report`** | 5 minutos por noite pela VPN: câmeras vivas, contagem de eventos, disco, miniaturas | Uma câmera cai no dia 3 e você descobre no dia 14 |
-
-### O roteiro da viagem
-
-**Dias 1–2 — instalação** *(os únicos dias de dedicação integral)*
-Levantamento → marcar a linha de parada → **aferir com o alvo impresso e o `aim`** → só então furar e montar → subir o `recorder` → **testar a VPN de dentro do local**
-
-**Dia 3 — GATE (2 horas)**
-Revisar as primeiras imagens · rodar o v0 · decidir se o enquadramento serve. **Sobram 11 dias para corrigir. Descobrir na volta é perder a viagem.**
-
-**Dias 4–14 — coleta autônoma** *(~15 min/dia)*
-Verificação diária pelo relatório · coleta deliberada dos casos difíceis: sol contra, chuva, contêiner repintado, duplo 20' e sobretudo a **transição dia↔noite** (a câmera troca o filtro IR-cut; é o pior caso e quase não aparece em amostragem aleatória)
-
-**Último dia** — conferir integridade dos dados no HD · fotografar a instalação · deixar o `recorder` rodando
-
----
-
-## 6. Estratégia de dados
-
-**Coletar ≠ anotar.** A coleta é automática e gratuita; a anotação é que custa. Colete tudo, anote com critério.
-
-### ⚠️ Só a 4K gera dado de treino
-
-As PAN entregam 20 px/caractere — treinar com elas ensinaria o reconhecedor a partir de imagens ilegíveis. **O dataset sai de uma câmera só.** As laterais geram evidência do evento, não dado de treino.
-
-Isso muda a aritmética:
-
-```
-volume da portaria × 14 dias = N eventos
-        ↓
-   N contêineres distintos          ← o número que importa
-        ↓
-   × 2–3 frames úteis da 4K
-        ↓
-   = dataset de treino
-```
-
-Com ~100 caminhões/dia: **1.400 eventos → 2.800 a 4.200 imagens de 1.400 contêineres distintos.**
-
-> **A meta se expressa em eventos, não em imagens:** colete todos os eventos das duas semanas, anote 2–3 frames da 4K de cada. O número final sai do que a portaria oferece, não de uma meta arbitrária.
->
-> E **2.800 imagens de 1.400 contêineres valem mais que 5.000 de 500** — a diversidade vem do número de eventos.
-
-### O que coletar
-
-| Fonte | O que gravar | Para quê |
-|---|---|---|
-| **4K do fundo** | Todos os eventos, 5 frames cada | **Dado de treino** |
-| 2 PAN laterais | 1 snapshot por evento | Evidência; custa pouco disco |
-| Todas | Timelapse de 30 s | Rede de segurança (~6 GB) |
-
-Fora: vídeo contínuo 24/7 pelas duas semanas — centenas de GB para cobrir um risco pequeno.
-
-### Anotação incremental
-
-```
-Anote 1.000 → treine → meça → só anote mais se o número exigir
-```
-
-Se precisar de mais, **anote 500 direcionadas aos casos onde o modelo errou** — valem mais que 2.000 aleatórias.
-
-### Critérios
-
-**Diversidade vem dos eventos.** Anotar 2 frames de 1.400 eventos é muito melhor que 10 frames de 280. Varie proprietário, cor, estado de conservação e tipo de contêiner.
-
-⚠️ **Se o volume da portaria for baixo** (40/dia → só 560 eventos em 2 semanas), o dataset fica curto. Nesse caso a Regra 4 abaixo — o `recorder` seguir rodando após a partida — deixa de ser conveniência e vira necessidade.
-
-**Estratificar por luz, não por horário:**
-
-| Condição | % | Observação |
-|---|---|---|
-| Dia, céu claro | 25% | O caso fácil |
-| Dia, nublado | 15% | |
-| **Sol direto / contraluz** | 15% | Sobre-representado de propósito |
-| **Noite com IR** | 25% | 25% da operação, se 24 h |
-| Chuva | 10% | |
-| **Casos especiais** | 10% | Repintado, sujo, duplo 20', oclusão |
-
-Os casos difíceis estão **deliberadamente sobre-representados** em relação à frequência real: se apenas 5% dos casos são noturnos com chuva e você anotar 5%, o modelo vê exemplos demais de menos para aprender.
-
-### Custo da anotação
-
-| Modo | 1.000 (1ª rodada) | ~3.000 (dataset típico) |
-|---|---|---|
-| Caixa + transcrição manual | ~4 h | ~13 h |
-| **Com o log do sistema principal** | **~1,5 h** | **~4 h** |
-
-⭐ Se o sistema principal registra a entrada digitada pelo porteiro, esse log casado por timestamp entrega a transcrição pronta. **Vale ~9 horas de trabalho manual** — e nesse cenário anotar o conjunto inteiro fica tão barato que a estratégia incremental perde importância.
-
-### Pipeline de treino
-
-**Reconhecedor, em três camadas:**
-
-1. **Sintéticos** — 50–100 mil, grátis, transcrição perfeita por construção
-2. **TRUDI** — ~3.100 recortes reais com transcrição (§7.1), *sujeito à decisão de licença*
-3. **Nossos dados** — fine-tune final com os recortes da portaria, depois realimentado pelas correções manuais da API
-
-As duas primeiras camadas produzem o **modelo v0** que viaja com você. A terceira é a que leva o sistema a 90–97%.
-
----
-
-## 7. Recursos externos
-
-| Recurso | Situação |
-|---|---|
-| **PaddleOCR** (repo local, 3.7.x) | ✅ Essencial. Usar `ppocr/` + `tools/` + `configs/` para treinar. A API 3.x não entra no produto |
-| **`paddleocr-js`** | ⭐ Roda PP-OCRv5 em ONNX Runtime puro. **Ler antes de escrever nosso wrapper** — traz o pré/pós-processamento já isolado, que é onde a conversão para ONNX costuma falhar em silêncio |
-| **Pesos PP-OCR** (`det`, `rec`, `cls`) | 🔴 **Não vêm no repositório.** Baixar na semana 1 — sem eles não há ponto de partida para o treino |
-| Dataset Kaggle/Roboflow (`archive`) | 🟡 Uso marginal: o detector saiu da arquitetura. Serve para medir o baseline do PP-OCR (~1 dia) |
-| **TRUDI — `text_recognition`** (BMVC 2025) | ✅ **Auditado, e é bom.** Recortes **com transcrição**, formato MMOCR. Ver §7.1 · ⚠️ **CC BY-SA 4.0 — ShareAlike**: resolver com a empresa **antes de treinar** |
-| Fontes OFL para sintéticos | 4–6 fontes condensadas e stencil |
-| MediaMTX + vídeos de contêiner | ⭐ Serve RTSP falso — **é o que permite desenvolver sem as câmeras** nas semanas 2–3 |
-| VC++ Redistributable | Embarcar no instalador; falta num Windows novo e derruba o serviço |
-
-**Regra:** nada baixa em runtime. Todo modelo, fonte e binário vai embarcado, com caminho absoluto vindo do `config.yaml`.
-
-### 7.1 TRUDI `text_recognition` — auditado
-
-Recortes de palavra **com transcrição**, formato MMOCR `TextRecogDataset`. Baixar **só esta pasta** (47 MB) — as outras (`coco`, `labelme`, `yolo`, `text_detection`, 11 GB) são as mesmas imagens em outros formatos.
-
-```json
-{"instances": [{"text": "OOLU0208218"}], "img_path": "textrecog_imgs//0276_0.jpg"}
-```
-
-**O que serve** — dos 4.365 recortes de `both`:
-
-| Família | Qtd | |
-|---|---|---|
-| **Código ISO 6346** (`[A-Z]{4}\d{7}`) | **2.080** | ✅ o alvo |
-| **Size/type code** (`\d{2}[A-Z]\d`) | **1.026** | ✅ também no escopo |
-| Placa alemã (`HRO-M8006`) | 549 | ❌ filtrar |
-| Truncados e ruído (`45G`, `H`, `3`) | 680 | ❌ filtrar |
-
-**~3.100 amostras reais com transcrição** — cobre código e size/type.
-
-**Decisões antes de treinar:**
-
-1. **Ignorar `both`** — é cópia byte-a-byte de `aerial`+`ground` (~4,3 mil JPEGs redundantes)
-2. **Filtrar por família** — manter só ISO 6346 e size/type; descarta 29%
-3. **Dicionário sem hífen** (o hífen só existe por causa das placas) — mas **incluir o `J`**, que não aparece no dataset e é categoria válida do ISO 6346
-4. **Filtrar imagens < 16 px de altura** — há recortes de 6×6 px
-5. **Resize para altura 32** — a mediana do dataset é 35–46 px, bate com o padrão do PP-OCR sem upscale
-6. **Treinar com `aerial`+`ground`, validar em `ground`** — o aerial é drone (AR ~5); o ground (AR ~2,2) parece com a portaria
-7. **Converter MMOCR → PaddleOCR** (JSON → TSV `caminho⇥texto`), script de ~15 linhas
-
-⚠️ **Há recortes com AR < 1 — texto vertical**, o código empilhado na porta. Confirma que o pré-processamento não pode assumir texto horizontal.
-
-**Impacto na estimativa do v0:** de 60–80% para **75–85%**. O destino não muda; a linha de partida sim — e um v0 melhor torna o gate do dia 3 mais conclusivo.
-
----
-
-## 7.2 Dimensionamento
-
-### O produto entregue
+### Restrições dadas
 
 | | |
 |---|---|
-| **Instalador** (Inno Setup, LZMA2) | **~120 MB** |
-| Instalado em disco | ~250 MB |
-| Composição | OpenCV 50 · modelos ONNX 55 · NumPy 25 · Python 20 · FastAPI e resto 35 · VC++ 25 |
-
-Com GPU: DirectML soma ~40 MB; **CUDA somaria ~1 GB** (DLLs do provider precisam ir junto num sistema offline). **Se precisar de GPU, DirectML.**
-
-### Crescimento em operação — ~100 caminhões/dia
-
-| | Por dia | Por mês |
-|---|---|---|
-| Banco SQLite | ~200 KB | ~6 MB |
-| **Imagens de evidência** | ~350 MB | **~10,5 GB** |
-
-**Com retenção de 30 dias, estabiliza em ~11 GB.** Sem retenção: ~128 GB/ano até o disco encher e o serviço parar — por isso a política de retenção é obrigatória desde o dia 1, não refinamento posterior.
-
-### Espaço necessário
-
-| Onde | Quanto |
-|---|---|
-| PC do cliente | ~11 GB estáveis (SSD de 512 GB é folgado) |
-| PC do local, durante a coleta | ~105–150 GB |
-| **Sua máquina de desenvolvimento** | **reservar ~200 GB** — dados da viagem, sintéticos, checkpoints de treino |
-
-## 7.3 Esforço estimado
-
-⚠️ *Estimativas para calibrar expectativa, não compromisso.*
-
-| Bloco | % | Horas |
-|---|---|---|
-| A — Hardware e Instalação | 15% | 55–70 h |
-| **B — Dados e Modelo** | **40%** | **140–180 h** |
-| C — Aplicação | 30% | 105–135 h |
-| D — Entrega e Operação | 15% | 55–70 h |
-| **Total** | | **~355–455 h** |
-
-Distribuídas em ~14 semanas de calendário (set/2026 → dez/2026), com dedicação parcial.
-
-### Hardware a adquirir (fora as 2 VIP 5180 PAN já compradas)
-
-| Item | Estimativa |
-|---|---|
-| Câmera do fundo — **4K / 8 MP** | R$ 1.500 – 3.000 |
-| PC | R$ 4.000 – 8.000 |
-| Switch PoE, cabos, acessórios | R$ 1.000 – 2.000 |
-| HD externo 2 TB, nobreak | R$ 1.000 – 1.500 |
-| **Total** | **R$ 7.500 – 14.500** |
-
-*Valores de referência para agosto/2026 — cotar antes de fechar.*
+| Câmeras laterais | 2× **Intelbras VIP 5180 PAN FT** (já adquiridas) |
+| Câmera traseira | 1× Intelbras **4K**, modelo a definir |
+| Veículo | **Para completamente** na portaria |
+| Plataforma | **Windows, como serviço** — sem janela gráfica aberta |
+| Configuração | Precisa de interface, mas não pode ser app de desktop aberto |
+| Correção humana | Acontece **no outro sistema, via nossa API** |
+| Licenciamento | **Uso interno, um cliente só** — sem distribuição a terceiros |
+| Base técnica | PaddleOCR + dataset TRUDI |
+| Dataset próprio | ~3.000 imagens, coletadas uma vez, embarcadas no produto |
 
 ---
 
-## 8. Pendências que travam o projeto
+## 2. Decisões de arquitetura
 
-**Perguntar ao responsável — hoje ou amanhã:**
+| Decisão | Por quê |
+|---|---|
+| **Treinar com PaddleOCR, executar com ONNX Runtime** | PaddlePaddle/PaddleX em produção arrasta ~1 GB de dependências, conflita com DLLs no Windows e tenta baixar modelos na inicialização. ONNX Runtime roda o mesmo modelo com ~50 MB e sem rede. |
+| **Usar RapidOCR (Apache-2.0) como camada de inferência** | Ele já é exatamente isso: modelos PaddleOCR em ONNX Runtime, com pré/pós-processamento (DBNet unclip, CTC decode, angle cls) implementado e testado. Aceita `det_model_path`, `rec_model_path`, `rec_keys_path` locais. **Economiza a parte onde a conversão para ONNX falha em silêncio.** |
+| **Fusão das 3 câmeras por votação de caractere** | O mesmo código de 11 caracteres está impresso nos 3 lados. Três leituras independentes + check digit ISO 6346 como árbitro elevam a acurácia muito acima de qualquer câmera isolada. Esta é a alavanca principal do projeto. |
+| **Captura híbrida: substream RTSP + snapshot em resolução plena** | Ver §3. |
+| **ROI configurada, sem detector treinado no degrau 1** | Câmera fixa + veículo parado em posição marcada = região previsível. Elimina um modelo inteiro. Detector entra só se a medição mostrar necessidade. |
+| **Dicionário de 36 caracteres (`A–Z`, `0–9`)** | Camada de saída cai de ~6.600 classes (dicionário chinês do PP-OCR) para 36. Modelo menor, mais rápido, e impossibilita por construção a saída de caracteres inválidos. |
+| **FastAPI + SQLite + Jinja2/HTMX** | Serviço único que atende a API de integração *e* serve as páginas de configuração. Zero administração, zero build de frontend, arquivo único de banco. |
+| **Nada baixa em tempo de execução** | Todo modelo, fonte e binário vai embarcado com caminho absoluto vindo do `config.yaml`. Requisito de serviço Windows rodando como `LocalSystem`. |
 
-1. **Modelo exato da 4K do fundo** → verificar os 4 pontos do §3, sobretudo o **desempenho noturno** (sensor, Starlight, lux). A distância deixou de ser risco nesta posição, mas a leitura com IR ainda não está garantida
-2. **As portas ficam sempre voltadas para trás?** → com uma única câmera de leitura, define **quantos eventos o sistema simplesmente não conseguirá ler**. Se a orientação variar bastante, esses casos vão todos para digitação manual — e a meta de auto-aceite (§9) precisa ser revista para baixo
-3. **Existe link de internet no local?** → ⚠️ *"offline" é o software; a VPN precisa de link.* Sem ele, o comissionamento exige segunda viagem
-4. **O sistema principal exporta o log de entradas digitadas?** → decide se a anotação custa 6 h ou 21 h
+### Licenças — resolvidas pela resposta "uso interno, um cliente só"
 
-**Decidir internamente na empresa:**
+- **TRUDI (CC BY-SA 4.0): liberado.** As obrigações da CC BY-SA disparam ao *compartilhar* material adaptado. Sem distribuição a terceiros, não disparam. Registrar a atribuição no `NOTICE.md` do repositório de qualquer forma. → **~3.100 recortes reais rotulados entram no treino.**
+- **Ultralytics YOLO (AGPL-3.0): evitável, então evite.** Sem distribuição, o gatilho principal da AGPL não dispara, mas a cláusula §13 (interação remota por rede) é área cinzenta que não vale defender. **YOLOX é Apache-2.0** e resolve o mesmo problema — use YOLOX se o degrau 2 for acionado.
+- **PaddleOCR: Apache-2.0.** Sem restrição. **RapidOCR: Apache-2.0.** Sem restrição.
 
-5. **Licença CC BY-SA 4.0 do TRUDI** → o ShareAlike é compatível com o produto comercial fechado? **Vale ~3.100 amostras reais** (§7.1). Se vetado, o v0 depende só dos sintéticos e cai de ~80% para ~60–70%
-6. **Licença do detector** — Ultralytics é AGPL-3.0; usar YOLOX ou RT-DETR. Só relevante se subir ao degrau 2
+### A escada de complexidade
 
-**Também na semana 1:** distância em cabo até o PC (⚠️ **PoE tem limite de 100 m**) · energia e aterramento · autorização para furar · escada ou plataforma · EPI e integração de segurança · endereço de entrega das câmeras
+Comece no degrau 1. Suba apenas quando uma **medição** mostrar necessidade — nunca por antecipação.
+
+| | Adicionar | Sintoma que justifica |
+|---|---|---|
+| **1** | ROI fixa + PP-OCR + ISO 6346 + fusão 3 câmeras | *(ponto de partida)* |
+| 2 | Detector YOLOX da região do código | ROI fixa erra: caminhão fora de posição, 20' e 40' em alturas diferentes |
+| 3 | Beam search com top-K por posição | Erros recorrentes de exatamente 1 caractere |
+| 4 | Super-resolução no recorte antes do OCR | px/caractere ficou entre 20 e 28 e não dá para reposicionar a câmera |
 
 ---
 
-## 9. Riscos
+## 3. Conectividade das câmeras — RTSP é parte da resposta, não toda ela
 
-| Risco | Mitigação |
+**Pergunta feita: "RTSP ou tem forma melhor?"** — A melhor forma é usar **três canais diferentes da mesma câmera, cada um para o que faz bem**. Câmeras Intelbras VIP são baseadas em Dahua e expõem os três.
+
+| Canal | Uso | Custo |
+|---|---|---|
+| **RTSP substream** (`.../cam/realmonitor?channel=1&subtype=1`, ~704×576) | Ficar sempre ligado. Detecção de presença/movimento e "o caminhão parou". | ~1% de CPU por câmera |
+| **HTTP CGI snapshot** (`/cgi-bin/snapshot.cgi?channel=0`) | **Os frames que vão para o OCR.** JPEG em resolução plena direto do ISP da câmera. | Sob demanda |
+| **ONVIF** (`onvif-zeep-async`) | Descoberta, URI de snapshot e de stream, sincronismo de hora, e **eventos de IVS/motion por PullPoint** — a própria câmera pode ser o gatilho. | Desprezível |
+
+**Por que snapshot em vez de frame do RTSP main:** o frame extraído do H.264/H.265 carrega artefato de compressão inter-quadro exatamente na borda de caractere, que é o que o OCR precisa. O snapshot é um JPEG intra-quadro gerado pelo ISP. Além disso, decodificar 3 streams 4K continuamente custa CPU real; o substream custa quase nada.
+
+⚠️ **Limitações a validar em bancada, semana 1:**
+1. O `snapshot.cgi` de linha Dahua costuma ser limitado a ~1 fps e **pode travar a câmera se chamado em laço apertado**. Com veículo parado isso basta: 3–5 snapshots em 4 s. Testar antes de fechar o desenho.
+2. A resolução do snapshot segue a configuração de *foto* da câmera, não a do stream — **conferir que está em 8 MP**, não no padrão baixo.
+3. Se o snapshot não entregar resolução plena, o plano B é decodificar o RTSP **main** só durante a janela do evento (~4 s), com `ffmpeg`/PyAV, e desligar entre eventos.
+
+**Ordem de gatilho, do melhor para o pior:**
+1. **Chamada do sistema principal** (`POST /v1/events`) — ele já sabe que um caminhão chegou. Preferível: zero falso positivo.
+2. Evento ONVIF de IVS da câmera (line crossing / intrusion).
+3. Detecção de movimento própria sobre o substream (diferença de frames + estabilização).
+
+O sistema deve suportar os três, configuráveis. Implementar 1 e 3; 2 se o modelo da câmera expuser.
+
+---
+
+## 4. Óptica — a conta que decide se o projeto funciona
+
+O critério não é megapixel, é **altura em pixels por caractere**. Caracteres ISO 6346 têm 100 mm. **Meta: ≥30 px. Abaixo de 20 px nenhum OCR lê de forma confiável.**
+
+### 4.1 Câmeras laterais — VIP 5180 PAN FT
+
+Especificação: sensor 1/2.7" 4 MP, **2880×1620**, lente fixa **2,1 mm**, **180° H × 78° V**.
+
+Como é uma panorâmica com projeção cilíndrica (não retilínea), a conta correta é angular, não por tangente:
+
+```
+px/caractere = (1620 px ÷ 78°) × (5,73° ÷ d)  ≈  119 ÷ d      [d em metros]
+```
+
+| Distância até o código | px/caractere | |
+|---|---|---|
+| 2,0 m | 60 | ✓✓ folgado |
+| 2,5 m | 48 | ✓✓ |
+| 3,0 m | 40 | ✓✓ |
+| 3,5 m | 34 | ✓ |
+| **4,0 m** | **30** | ✓ **limite** |
+| 5,0 m | 24 | ⚠️ degrada |
+| 6,0 m | 20 | ❌ não lê |
+
+**⚠️ A distância que conta não é a lateral, é a diagonal.** Com a câmera a `L` metros da lateral do contêiner e o código a `x` metros de deslocamento longitudinal em relação ao eixo da câmera:
+
+```
+d = √(L² + x²)
+```
+
+Um contêiner de 40' tem 12,19 m. Com a câmera a 3 m da lateral, mirando o meio: código no centro → 40 px; código a 6 m do centro → `d = 6,7 m` → **18 px, ilegível**.
+
+**Consequência de projeto, e é a mais importante do documento:**
+
+> As VIP 5180 PAN **leem**, mas só se forem montadas **a ≤3,5 m da lateral do contêiner E longitudinalmente alinhadas com onde o código realmente está** — não com o meio do contêiner. Alinhar com o meio desperdiça a câmera.
+
+O FOV de 180° é vantagem aqui: mesmo montada bem perto, ela enxerga o caminhão inteiro, então o alinhamento é sobre *resolução*, não sobre *enquadramento*. Precisa-se saber onde o código fica na lateral — normalmente na parte superior, próximo à extremidade das portas. **Item A1 do plano: fotografar 10 contêineres típicos do cliente e medir a posição do código.**
+
+### 4.2 Câmera traseira — 4K, a definir
+
+Projeção retilínea, conta padrão:
+
+```
+px/caractere = 0,10 m ÷ (2 × d × tan(AFOV_v ÷ 2)) × 2160 px
+```
+
+| Distância | 2,8 mm (AFOV_v ≈ 58°) | **3,6 mm (AFOV_v ≈ 47°)** | 6 mm (AFOV_v ≈ 29°) |
+|---|---|---|---|
+| 3 m | 65 ✓✓ | **84 ✓✓** | 139 ✓✓ |
+| 5 m | 39 ✓✓ | **50 ✓✓** | 84 ✓✓ |
+| 7 m | 28 ⚠️ | **36 ✓✓** | 60 ✓✓ |
+| 9 m | 22 ❌ | **28 ⚠️** | 46 ✓✓ |
+| 12 m | 16 ❌ | 21 ❌ | 35 ✓ |
+
+**Recomendação de compra, em ordem:**
+
+1. ⭐ **4K com zoom motorizado / varifocal** (linha Intelbras VIP 9860 IA FT ou equivalente 8 MP com lente motorizada). **Elimina o risco da distância por completo** — ajusta-se no local, sem refazer furação. Vale a diferença de preço, porque o erro de enquadramento é o modo de falha mais caro do projeto.
+2. **4K fixa 3,6 mm** (linha VIP 3830 B IA: 8 MP, 3,6 mm, Starlight, IR 30 m, PoE). Cobre 3–8 m confortavelmente. Escolha correta **se a distância já estiver medida e travada**.
+3. ❌ **Evitar 4K com lente 2,1 mm ou fisheye/panorâmica.** Recai no mesmo problema da 5180 PAN.
+
+**⚠️ A armadilha noturna, contraintuitiva:** 8 MP num sensor 1/2.8" tem pixels *menores* que 4 MP no mesmo sensor — capta menos luz e gera mais ruído. Se a portaria opera 24 h, ~25% dos eventos serão com IR. Antes de comprar, verificar:
+
+- **Tamanho do sensor** — 1/1.8" é muito superior a 1/2.8" em 4K
+- **Starlight** presente e **iluminação mínima ≤0,005 lux**
+- **Alcance do IR** ≥30 m
+- **Taxa de quadros em 8 MP** — algumas caem para 15 fps (irrelevante com veículo parado, mas indica limitação do ISP)
+
+> Uma 4 MP Starlight num sensor grande pode ler melhor à noite que uma 4K comum. **A pergunta muda de "tem resolução?" para "enxerga no escuro?".**
+
+### 4.3 Ferramenta obrigatória: `siamac-aim`
+
+Utilitário de linha de comando que, apontado para uma câmera, mede **ao vivo**: px/caractere sobre um alvo impresso de dimensão conhecida, nitidez (variância do Laplaciano) e histograma de exposição. Tem calculadora reversa: *"para 30 px/caractere com esta lente, monte entre X e Y metros."*
+
+**Roda antes de furar a parede.** Sem ela, o enquadramento é chute e o erro só aparece semanas depois, quando o modelo não converge.
+
+---
+
+## 5. Arquitetura de software
+
+### 5.0 Stack
+
+**A decisão estrutural é que existem dois ambientes, e eles nunca se misturam.**
+
+```
+┌─ TREINO ──────────────────┐        ┌─ PRODUÇÃO ────────────────┐
+│ nossa máquina, com GPU    │        │ PC da portaria, offline   │
+│ PaddlePaddle + PaddleOCR  │ .onnx  │ ONNX Runtime + RapidOCR   │
+│ pesado, ~4 GB             │ ─────► │ leve, ~250 MB             │
+│ roda algumas vezes        │        │ roda 24/7 como serviço    │
+└───────────────────────────┘        └───────────────────────────┘
+```
+
+O produto entregue **não contém PaddlePaddle**. O único artefato que atravessa a fronteira é o `.onnx`. O CI verifica isso (§10).
+
+#### Produção — o que vai no PC do cliente
+
+| Camada | Escolha | Por quê |
+|---|---|---|
+| Runtime | **Python 3.13** | Wheels maduras em `onnxruntime`, `opencv` e `PyInstaller`. O 3.14 ainda está entrando no onnxruntime — não vale o risco num sistema offline |
+| Dependências | **uv** + lockfile | Reprodutível e rápido. `uv export` gera o requirements travado para o build sem rede |
+| Inferência | **onnxruntime** (CPU) | ~50 MB. Sem PaddlePaddle, sem PaddleX, sem conflito de DLL |
+| OCR | **rapidocr** (Apache-2.0) | Pré/pós-processamento PP-OCR já resolvido |
+| Visão | **opencv-python-headless** | ⚠️ **`headless`, não o pacote cheio.** O completo arrasta Qt, é ~50 MB maior, e um serviço Windows não tem sessão gráfica para inicializá-lo |
+| RTSP | **PyAV** | ⚠️ `cv2.VideoCapture` **trava indefinidamente** quando a câmera some — sem timeout confiável. Num serviço 24/7 isso é uma thread morta silenciosa. PyAV dá controle real de timeout e reconexão |
+| HTTP client | **httpx** | Snapshot CGI e webhook. Timeouts sãos por padrão, sync e async na mesma API |
+| ONVIF | **onvif-zeep-async** | Descoberta, snapshot URI, hora, eventos PullPoint |
+| API + UI | **FastAPI** + **uvicorn** | Um processo serve os dois binds (§5.3). OpenAPI automática para a integração |
+| Templates | **Jinja2 + HTMX** (arquivo local) | Sem `npm`, sem build step. O instalador offline não precisa de toolchain de frontend |
+| Banco | **SQLite** + **SQLAlchemy 2.x** + **Alembic** | Arquivo único, zero administração, migração versionada |
+| Config | **pydantic-settings** + **PyYAML** | Valida no boot e **falha alto**. Config errada não pode virar comportamento estranho três dias depois |
+| Logs | **structlog** → JSON em arquivo rotativo | Serviço não tem console. Log estruturado é o que torna o diagnóstico remoto possível |
+| Empacotamento | **PyInstaller** em modo **`onedir`** | ⚠️ **Não `onefile`:** ele extrai tudo para o temp a cada boot (lento, e permissão de temp sob `LocalSystem` é imprevisível) e dispara heurística de antivírus corporativo |
+| Serviço | **WinSW** (MIT) | Envelopa o `.exe` como serviço Windows, com restart automático |
+| Instalador | **Inno Setup** | Embarca o VC++ Redistributable e cria a regra de firewall |
+
+#### Treino — máquina separada
+
+| Camada | Escolha |
 |---|---|
-| 🔴 **A câmera não lê** — confirmado na 5180 PAN | Volume de dados não corrige óptica. Depende de o cliente aprovar a câmera de leitura |
-| 🔴 **Voltar com dado inutilizável** | `aim` antes de furar · `daily_report` toda noite · **gate do dia 3** · timelapse redundante |
-| 🟠 **Erro silencioso** — pior que não ler | O check digit é `mod 11`: **~1 em 11 códigos errados passa por acaso**. Na dúvida, `NEEDS_REVIEW`. **KPI crítico: erro aceito sem aviso ≤ 0,5%** |
-| 🟠 **Licenças** | Ultralytics = AGPL · TRUDI = ShareAlike · Roboflow = verificar procedência. **Resolver antes de treinar** — corrigir depois significa retreinar do zero |
-| 🟠 **Bloqueio no dia 1** | Autorização, escada, tomada, EPI. Confirmar por escrito antes de viajar |
-| 🟡 **Cache não visível ao serviço** | Serviço Windows roda como `LocalSystem`, não vê `C:\Users\victo\.paddlex\`. Resolvido por ONNX com caminho absoluto |
+| Runtime | **Python 3.12** — mais conservador; o ecossistema de treino é mais rodado nele |
+| Framework | **PaddlePaddle (GPU)** + **PaddleOCR clonado do repositório** (não o pacote pip — precisamos de `configs/rec/` e `tools/train.py`) |
+| Export | **paddle2onnx** + **onnxsim** |
+| Sintéticos | **SynthTIGER** ou **TextRecognitionDataGenerator** |
+| Anotação | **PPOCRLabel v3** |
+| Experimentos | CSV ou SQLite simples. MLflow só se o número de experimentos justificar — não antes |
 
-### Expectativa realista
+#### Desenvolvimento e CI
 
-Sistemas comerciais consolidados atingem 95–99% em portaria com veículo parado. Um sistema próprio bem feito chega a **90–97%**. Prometer 99,9% é irrealista.
+**pytest** + `pytest-asyncio` + `pytest-cov` · **httpx** como cliente de teste · **MediaMTX** servindo RTSP falso · **ruff** (lint e format) · **mypy** no núcleo (`iso6346`, `fusion`, `storage`) · GitHub Actions em matriz Linux + Windows
 
-**Metas a acordar:** auto-aceite correto ≥92% · **erro silencioso ≤0,5%** · resposta ≤3 s · disponibilidade ≥99%
+#### Descartados, e por quê
+
+| Alternativa | Por que não |
+|---|---|
+| **Docker no cliente** | Windows offline, serviço nativo. Docker Desktop adiciona licença, camada de virtualização e um ponto de falha no boot |
+| **PostgreSQL** | Nó único, um banco pequeno. SQLite não tem administração — e administração remota por VPN é o que queremos evitar |
+| **React / Vue** | Build step de frontend dentro de um instalador offline é dor sem retorno. HTMX cobre o caso |
+| **Celery + Redis** | O outbox é uma tabela SQLite com um worker asyncio. Dois serviços a menos para subir no boot |
+| **Nuitka** no lugar do PyInstaller | Binário melhor, mas build frágil com `opencv` e `onnxruntime`. PyInstaller é o caminho conhecido e depurável |
+| **GPU (CUDA)** | Só se a medição exigir. E aí **DirectML (~40 MB)**, não CUDA — as DLLs do provider CUDA somam ~1 GB num sistema que precisa ir embarcado |
+| **PaddleOCR em runtime** | Tenta baixar modelo na inicialização mesmo com cache local, e arrasta PaddleX inteiro. É a razão de existir da fronteira acima |
+
+```
+siamac-container/
+├─ pyproject.toml                 # uv / hatchling
+├─ config.example.yaml
+├─ NOTICE.md                      # atribuições: TRUDI, PaddleOCR, RapidOCR
+├─ src/siamac/
+│  ├─ config.py                   # pydantic-settings, valida no boot e falha alto
+│  ├─ cameras/
+│  │  ├─ onvif_client.py          # descoberta, URIs, hora, eventos PullPoint
+│  │  ├─ substream.py             # RTSP substream em loop, com reconexão
+│  │  └─ snapshot.py              # HTTP CGI + fallback RTSP main
+│  ├─ trigger/
+│  │  ├─ api_trigger.py           # POST /v1/events
+│  │  └─ motion.py                # diferença de frames sobre o substream
+│  ├─ capture.py                  # rajada 3–5 frames × 3 câmeras + score de nitidez
+│  ├─ roi.py                      # recorte por ROI configurada (+ YOLOX no degrau 2)
+│  ├─ ocr/
+│  │  ├─ engine.py                # wrapper fino sobre RapidOCR, modelos locais
+│  │  └─ preprocess.py            # deskew, CLAHE, upscale, texto vertical
+│  ├─ iso6346.py                  # check digit mod-11, size/type, correção posicional
+│  ├─ fusion.py                   # ⭐ votação por caractere entre as 3 câmeras
+│  ├─ storage/
+│  │  ├─ models.py                # SQLAlchemy: Event, Read, Image, OutboxItem
+│  │  ├─ retention.py             # purga por idade — obrigatória desde o dia 1
+│  │  └─ migrations/              # Alembic
+│  ├─ api/
+│  │  ├─ routes_events.py         # integração + correção humana
+│  │  ├─ routes_admin.py          # saúde, câmeras, diagnóstico
+│  │  └─ outbox.py                # webhook com retry exponencial e DLQ
+│  ├─ webui/                      # Jinja2 + HTMX, sem build step
+│  │  ├─ cameras.html             # credenciais, teste de conexão, snapshot ao vivo
+│  │  ├─ roi.html                 # desenhar ROI sobre snapshot, em canvas
+│  │  ├─ thresholds.html          # limiares de confiança e auto-aceite
+│  │  └─ diagnostics.html         # últimos eventos, latência, disco
+│  └─ service/
+│     ├─ supervisor.py            # laço principal, watchdog das câmeras
+│     └─ winservice.py            # entrypoint para WinSW
+├─ tools/
+│  ├─ aim.py                      # §4.3 — medidor de px/caractere
+│  ├─ recorder.py                 # coletor de dataset autônomo
+│  ├─ synth.py                    # gerador de sintéticos
+│  ├─ trudi_convert.py            # MMOCR JSON → TSV do PaddleOCR
+│  └─ export_onnx.py              # Paddle → ONNX + verificação de paridade
+└─ tests/
+```
+
+### 5.1 O módulo que carrega o projeto: `fusion.py`
+
+O mesmo código de 11 caracteres está nos 3 lados do contêiner. Três leituras independentes permitem votação:
+
+```
+Câmera ESQ:  M S C U 4 5 6 7 8 2 1   conf: [.99 .98 .97 .91 .99 .88 .95 .99 .97 .93 .99]
+Câmera DIR:  M S C U 4 5 6 7 8 2 1   conf: [.97 .99 .95 .96 .98 .94 .89 .98 .99 .90 .98]
+Câmera FUN:  M 5 C U 4 5 6 7 8 2 1   conf: [.99 .61 .99 .99 .99 .97 .99 .99 .99 .96 .99]
+             ─────────────────────
+Votação:     M S C U 4 5 6 7 8 2 1   ← posição 2 resolvida por maioria + confiança
+Check digit: ✓ válido
+Resultado:   MSCU4567821  · confiança agregada 0,96 · AUTO_ACCEPT
+```
+
+Regras, em ordem:
+1. Votação ponderada por confiança, caractere a caractere
+2. **Check digit ISO 6346 (`mod 11`) sobre o resultado da votação**
+3. Se falhar, testar as combinações top-2 por posição (busca limitada) procurando uma que valide
+4. Se ainda falhar, ou se as câmeras discordarem acima de um limiar, → `NEEDS_REVIEW`
+5. Correção posicional determinística: posições 1–4 são sempre letras, 5–11 sempre dígitos. `O↔0`, `I↔1`, `S↔5`, `B↔8`, `Z↔2`, `G↔6` são resolvidos pela posição antes de qualquer outra coisa
+
+⚠️ **O check digit `mod 11` não é garantia:** aproximadamente **1 em cada 11 códigos errados passa por acaso**. Ele reduz o erro silencioso, não o elimina. Por isso o limiar de auto-aceite considera *também* a concordância entre câmeras — dois erros idênticos em duas câmeras diferentes são muito improváveis.
+
+### 5.2 API — contrato com o sistema principal
+
+**Transporte: HTTP puro, sem TLS.** Decisão consciente, adequada ao cenário (rede interna, um cliente, serviço offline). O que se ganha: nenhum certificado para emitir, instalar, renovar ou depurar — e certificado autoassinado num serviço offline é fonte garantida de aviso de navegador e de expiração silenciosa daqui a um ano. Toda resposta em JSON.
+
+⚠️ **O que HTTP puro implica, e como compensar:**
+
+| Consequência | Compensação obrigatória |
+|---|---|
+| A API key viaja em texto claro | Tratar como **credencial de rede interna, não como segredo forte**. Rotacionável pela tela de configuração. Nunca reutilizar senha de outro sistema |
+| Qualquer host da rede alcança a API | **Bind explícito** ao IP da interface interna (nunca `0.0.0.0`) + **allowlist de IPs de origem** em middleware. Regra de firewall do Windows criada pelo instalador |
+| A tela de configuração vai pelo mesmo canal | Servir a UI **apenas em `127.0.0.1`**, numa porta separada da API. Configuração local, integração pela rede — dois binds, dois escopos |
+| As imagens de evidência são acessíveis por URL | URLs de imagem com token opaco por evento, não sequenciais. Evita varredura trivial |
+| Webhook de saída também é HTTP | Combinar com o time do sistema principal: se eles oferecerem HTTPS no receptor, usar — o cliente HTTP nosso suporta os dois sem mudança de código |
+
+Registrar essa decisão no `NOTICE.md`/README com a justificativa, para que uma auditoria futura encontre a escolha documentada em vez de parecer descuido. **Se o sistema um dia sair da rede interna, TLS deixa de ser opcional** — deixar a configuração de `scheme` preparada no `config.yaml` para não exigir mudança de código.
+
+Autenticação por API key em header (`X-API-Key`).
+
+| Método | Rota | Uso |
+|---|---|---|
+| `POST` | `/v1/events` | Dispara uma leitura. Aceita `{"gate":"in","external_ref":"..."}`. Retorna `202` + `event_id`, ou `200` com resultado se `sync=true` |
+| `GET` | `/v1/events` | Lista com filtros `status`, `from`, `to`, paginado. `status=needs_review` é a **fila de correção humana** |
+| `GET` | `/v1/events/{id}` | Detalhe: código, confiança, leitura de cada câmera, URLs das imagens |
+| `GET` | `/v1/events/{id}/images/{camera}` | JPEG da evidência (`left`, `right`, `rear`, e `_crop` para o recorte) |
+| `PATCH` | `/v1/events/{id}` | **Correção humana.** `{"container_code":"MSCU4567821","iso_type":"45G1","corrected_by":"joao"}`. Valida o check digit e recusa código inválido com `422` |
+| `POST` | `/v1/events/{id}/confirm` | Confirma sem alterar (operador validou a leitura automática) |
+| `GET` | `/v1/cameras/status` | Estado de cada câmera: viva, último frame, latência |
+| `GET` | `/health` | Liveness/readiness |
+
+**Webhook de saída (outbox):** toda transição de estado gera um item numa tabela `outbox` e um worker entrega ao endpoint configurado com retry exponencial. **Não é `POST` direto e otimista** — se o sistema principal cair por 20 minutos, nada se perde. Item vencido vai para DLQ visível no diagnóstico.
+
+⭐ **Toda correção via `PATCH` grava o par (recorte, texto correto) numa tabela `training_samples`.** É rotulagem de graça, vinda da operação, que alimenta o próximo fine-tune. Este é o motor de melhoria contínua do sistema.
+
+### 5.3 Interface de configuração sem GUI aberta
+
+O serviço sobe **dois binds HTTP separados**, e a separação é o que torna o HTTP puro defensável:
+
+| | Bind | Alcance |
+|---|---|---|
+| **API de integração** | `<IP interno>:8477` | Rede interna, com allowlist de IPs e API key |
+| **Tela de configuração** | `127.0.0.1:8478` | **Só a própria máquina.** Nunca exposta na rede |
+
+O operador abre o navegador em `http://127.0.0.1:8478` no PC da portaria. **Nenhuma janela fica aberta; o serviço não depende de sessão de usuário logada.**
+
+Páginas: câmeras (credenciais, teste, snapshot ao vivo) · ROI (desenhar retângulo sobre o snapshot em `<canvas>`) · limiares · webhook e retenção · diagnóstico (últimos eventos com miniatura, latência, disco).
+
+Sem React, sem `npm`. Jinja2 + HTMX servidos pelo mesmo processo — o instalador não precisa de toolchain de frontend.
+
+---
+
+## 6. Modelo e dados
+
+### 6.1 As três camadas de treino
+
+| Camada | Volume | Papel |
+|---|---|---|
+| **1. Sintéticos** | 50–100 mil | Grátis, rótulo perfeito por construção. Ensina a forma dos 36 caracteres, fontes condensadas/stencil típicas de contêiner, degradação (desfoque, ruído, JPEG, perspectiva, ferrugem, repintura, IR monocromático) |
+| **2. TRUDI** | ~3.100 reais | ✅ Liberado (§2). Recortes reais com transcrição. Ensina a textura do mundo real |
+| **3. Dados próprios** | **~3.000** | O fine-tune que leva de ~80% para 90–97%. Sai da portaria do cliente |
+
+Camadas 1 e 2 produzem o **modelo v0**, que já viaja instalado com o sistema. Camada 3 é o que fecha a conta.
+
+### 6.2 A meta de ~3.000 imagens — e por que ela é mais barata do que parece
+
+Com **3 câmeras lendo o mesmo código**, cada evento gera **3 recortes rotulados com uma única transcrição**:
+
+```
+1.000 eventos  →  3.000 recortes rotulados  →  1 transcrição digitada por evento
+```
+
+**Isso é uma redução de 3× no custo de anotação.** Com ~100 caminhões/dia, 10 dias de coleta atingem a meta.
+
+E fica ainda melhor: **se o sistema principal registra o código que o porteiro digitou hoje**, o casamento por timestamp entrega as 1.000 transcrições prontas. A anotação cai de ~13 h para ~2 h de conferência. **Pergunta nº 4 do §9 — é a que mais vale dinheiro.**
+
+⚠️ **Diversidade vem de contêineres distintos, não de fotos.** 3.000 recortes de 1.000 contêineres valem muito mais que 3.000 de 300. Deduplicar por código antes de anotar.
+
+### 6.3 Estratificação — por luz, não por horário
+
+Casos difíceis **deliberadamente sobre-representados**: se apenas 5% dos eventos são noturnos com chuva e você anotar 5%, o modelo vê exemplos de menos para aprender.
+
+| Condição | Alvo |
+|---|---|
+| Dia, céu claro | 25% |
+| Dia, nublado | 15% |
+| Sol direto / contraluz | 15% |
+| Noite com IR | 25% |
+| Chuva | 10% |
+| Especiais (repintado, sujo, ocluído, duplo 20') | 10% |
+
+⚠️ **Incluir deliberadamente a transição dia↔noite.** A câmera troca o filtro IR-cut e a imagem muda por completo por alguns segundos. É o pior caso e quase não aparece em amostragem aleatória.
+
+### 6.4 `siamac-recorder` — coletor autônomo
+
+Roda no PC da portaria durante a coleta, sem supervisão: por evento, N snapshots de cada câmera + metadados (hora, condição de luz estimada, resultado do v0). Rotação por espaço em disco. Relatório diário consultável remotamente: câmeras vivas, contagem de eventos, disco livre, miniaturas.
+
+Sem o relatório diário, uma câmera cai no dia 3 e você descobre no dia 14.
+
+### 6.5 Pipeline de treino
+
+```
+tools/synth.py        → 50–100k sintéticos            (TextRecognitionDataGenerator ou SynthTIGER)
+tools/trudi_convert.py→ TRUDI MMOCR JSON → TSV        (~3.100, filtrado)
+PPOCRLabel            → anotação semiautomática dos dados próprios
+PaddleOCR configs/rec → treino (PP-OCRv5 rec como pesos iniciais, dicionário de 36 chars)
+tools/export_onnx.py  → paddle2onnx + verificação de paridade numérica
+                      → src/siamac/models/rec.onnx
+```
+
+**Filtros ao preparar o TRUDI** (o dataset mistura famílias):
+- Manter apenas `[A-Z]{4}\d{7}` (código ISO) e `\d{2}[A-Z]\d` (size/type); descartar placas alemãs e fragmentos truncados
+- Descartar recortes com altura < 16 px
+- Dicionário **sem hífen** (o hífen só existe por causa das placas), mas **com `J`** — categoria válida do ISO 6346 que pode não aparecer no dataset
+- Redimensionar para altura 32 (padrão PP-OCR, bate com a mediana do dataset sem upscale)
+
+⚠️ **Há recortes com aspect ratio < 1 — texto vertical**, o código empilhado na porta. O pré-processamento **não pode assumir texto horizontal**: detectar AR < 0,8 e rotacionar antes do reconhecedor.
+
+**Verificação de paridade após exportar ONNX (obrigatória):** rodar as mesmas 200 imagens no Paddle e no ONNX e comparar as saídas. Divergência silenciosa na conversão é o bug mais caro deste projeto — o modelo "funciona", só que 4% pior, e ninguém percebe.
+
+---
+
+## 7. Recursos externos pesquisados
+
+| Recurso | Licença | Papel | Link |
+|---|---|---|---|
+| ⭐ **RapidOCR** | Apache-2.0 | **Camada de inferência ONNX.** Pré/pós-processamento PP-OCR já resolvido. Aceita `det_model_path` / `rec_model_path` / `rec_keys_path` locais → funciona 100% offline | [RapidAI/RapidOCR](https://github.com/RapidAI/RapidOCR) |
+| **PaddleOCR** | Apache-2.0 | **Só treino.** `configs/rec/` + `tools/train.py`. Não entra no produto | [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) |
+| **PaddleOCRModelConvert** | Apache-2.0 | Conversão Paddle → ONNX pronta, do time do RapidOCR | [RapidAI/PaddleOCRModelConvert](https://github.com/RapidAI/PaddleOCRModelConvert) |
+| ⭐ **TRUDI / TITUS** (BMVC 2025) | CC BY-SA 4.0 | ~3.100 recortes reais com transcrição. Baixar **só** `text_recognition` — as pastas `coco`/`yolo`/`labelme` são as mesmas imagens em outros formatos (GBs desperdiçados) | [egulsoylu/trudi](https://github.com/egulsoylu/trudi) |
+| **PPOCRLabel v3** | Apache-2.0 | Anotação semiautomática: pré-rotula com o próprio modelo, humano corrige. Exporta direto no formato de treino do PP-OCR | [PFCCLab/PPOCRLabel](https://github.com/PFCCLab/PPOCRLabel) |
+| **MediaMTX** | MIT | ⭐ Serve vídeo local como RTSP falso. **É o que permite desenvolver e rodar CI sem as câmeras** | [bluenviron/mediamtx](https://github.com/bluenviron/mediamtx) |
+| **python-onvif-zeep-async** | MIT | ONVIF: descoberta, snapshot URI, hora, eventos PullPoint | [openvideolibs/python-onvif-zeep-async](https://github.com/openvideolibs/python-onvif-zeep-async) |
+| **SynthTIGER** | MIT | Gerador de sintéticos de qualidade superior ao TRDG (degradação mais realista) | [clovaai/synthtiger](https://github.com/clovaai/synthtiger) |
+| **TextRecognitionDataGenerator** | MIT | Alternativa mais simples ao SynthTIGER; suficiente para 36 classes | [Belval/TextRecognitionDataGenerator](https://github.com/Belval/TextRecognitionDataGenerator) |
+| **YOLOX** | Apache-2.0 | Detector, **se** o degrau 2 for acionado. Substituto livre do Ultralytics (AGPL) | [Megvii-BaseDetection/YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) |
+| Roboflow Universe — container | verificar caso a caso | 5+ datasets de detecção de código (1.230 / 1.001 / 304 imagens). Úteis para **medir baseline** e treinar detector; procedência de licença precisa ser conferida por dataset | [busca](https://universe.roboflow.com/search?q=class%3Acontainer+number) |
+| `lbf4616/ContainerNumber-OCR` | ⚠️ **sem licença** | Referência de arquitetura (PixelLink + LSTM). Dataset no Google Drive. **Sem licença = não usar código nem dados**; ler apenas | [lbf4616/ContainerNumber-OCR](https://github.com/lbf4616/ContainerNumber-OCR) |
+| `lamnguyenkhoa/container-code-recognition` | verificar | YOLOv4 + OCR sobre vídeo. Referência de pipeline | [lamnguyenkhoa/container-code-recognition](https://github.com/lamnguyenkhoa/container-code-recognition) |
+| ISO 6346 — validadores | vários | Vetores de teste para o `pytest`, incluindo o caso `check digit 10 → 0` | [datasets/ISO-Container-Codes](https://github.com/datasets/ISO-Container-Codes), [solyarisoftware/iso6346](https://github.com/solyarisoftware/iso6346) |
+| Fontes OFL condensadas/stencil | OFL | 4–6 fontes para os sintéticos | Google Fonts |
+| **WinSW** | MIT | Empacota o `.exe` como serviço Windows | [winsw/winsw](https://github.com/winsw/winsw) |
+| VC++ Redistributable | — | **Embarcar no instalador.** Falta num Windows limpo e derruba o serviço sem mensagem útil | — |
+
+**Referência de acurácia de mercado:** sistemas comerciais consolidados (Adaptive Recognition Carmen, Vaxtor, Intlab) declaram 95–99% em portaria com veículo parado. Um sistema próprio bem feito chega a **90–97%**. Prometer 99,9% é irrealista e cria conflito na entrega.
+
+---
+
+## 8. Fases de execução
+
+Ordem de dependência, não calendário fixo. **A fase 1 trava tudo:** sem câmera bem posicionada não há dado; sem dado não há modelo.
+
+### Fase 0 — Fundação
+- Esqueleto do projeto, `pyproject.toml`, config validada por Pydantic (falha alto no boot)
+- **`iso6346.py` com 100% de cobertura** — check digit, size/type, correção posicional. É o módulo mais barato de acertar e o mais caro de errar
+- SQLite + Alembic + modelos
+- MediaMTX no ambiente de dev servindo 3 vídeos como RTSP local
+
+### Fase 1 — Óptica e captura ⚠️ *bloqueante*
+- **`tools/aim.py`** e alvo de calibração impresso
+- Medir no local: distância disponível para cada câmera, posição do código na lateral dos contêineres do cliente
+- Decidir e comprar a 4K com a conta do §4.2 em mãos
+- Bancada: validar RTSP substream, `snapshot.cgi` em resolução plena, ONVIF, limite de taxa do snapshot
+- `cameras/` + `capture.py` com reconexão e watchdog
+
+### Fase 2 — OCR v0 e medição de baseline
+- `ocr/engine.py` sobre RapidOCR com PP-OCRv5 **pré-treinado** (ainda sem treino próprio)
+- `roi.py`, `fusion.py`
+- **Medir a acurácia do v0 nas primeiras imagens reais.** Este número decide todo o resto do projeto — não avance sem ele
+
+### Fase 3 — API e integração
+- Rotas do §5.2, outbox com retry, webhook
+- Interface web de configuração
+- Tabela `training_samples` alimentada pelo `PATCH`
+- Política de retenção **ativa desde já** — não é refinamento posterior; sem ela o disco enche e o serviço para
+
+### Fase 4 — Coleta ⭐
+- `tools/recorder.py` + relatório diário
+- ~10 dias de coleta → ~1.000 eventos → ~3.000 recortes
+- **Verificação diária remota.** Não deixe para conferir no fim
+
+### Fase 5 — Treino
+- Sintéticos → TRUDI → fine-tune com dados próprios
+- Export ONNX + **verificação de paridade**
+- Avaliação num conjunto de validação 100% local, separado por contêiner (não por imagem — senão vaza)
+
+### Fase 6 — Empacotamento
+- PyInstaller → `.exe`; WinSW → serviço; Inno Setup → instalador
+- **Teste da rede desligada** (§10)
+
+### Fase 7 — Piloto
+- Rodar **em paralelo** com a digitação manual por 2 semanas. Mede a acurácia real sem risco operacional
+- Calibrar os limiares **por medição**, não por chute
+- Só então liberar o modo automático
+
+---
+
+## 9. Pendências que travam o início
+
+**Perguntar ao responsável pela operação:**
+
+1. **Qual a distância disponível para cada câmera?** Decide o modelo da 4K e se as VIP 5180 PAN conseguem ler (§4).
+2. **Onde fica o código na lateral dos contêineres típicos do cliente?** Decide o alinhamento longitudinal das laterais. Fotografar 10 unidades resolve.
+3. **As portas ficam sempre voltadas para trás?** Se variar, a câmera traseira às vezes vê a frente do contêiner — que não tem o código no mesmo lugar. Afeta a meta de auto-aceite.
+4. ⭐ **O sistema principal exporta o log dos códigos digitados pelo porteiro?** Decide se a anotação custa 2 h ou 13 h (§6.2). **A pergunta de maior retorno da lista.**
+5. **Existe link de rede no local para manutenção remota?** "Offline" é o software; suporte remoto precisa de link.
+6. **A portaria opera 24 h?** Define o peso do caso noturno com IR no dataset e na escolha do sensor.
+
+**Verificações técnicas na primeira semana:**
+- `snapshot.cgi` entrega 8 MP? Qual o limite de taxa antes de a câmera travar?
+- Distância em cabo até o PC — **PoE tem limite de 100 m**
+- Energia, aterramento, autorização para furar, escada/plataforma, EPI
 
 ---
 
 ## 10. Verificação
 
-**Testes automatizados** — `pytest` no ISO 6346 (vetores conhecidos e o caso `check digit 10 → 0`) · API com `httpx` (fluxo completo: evento → processa → corrige → webhook) · outbox com destino derrubado
+**Testes automatizados**
+- `pytest` sobre `iso6346.py` com vetores conhecidos, incluindo `check digit 10 → 0` e todos os prefixos de proprietário do arquivo `ISO-Container-Codes`
+- `fusion.py`: casos sintéticos de 3 leituras discordantes → resultado esperado e estado esperado (`AUTO_ACCEPT` vs `NEEDS_REVIEW`)
+- API com `httpx`: fluxo completo — dispara evento → processa → `PATCH` de correção → webhook entregue → linha em `training_samples`
+- Outbox com o destino derrubado: itens acumulam, destino volta, tudo é entregue na ordem
+- **Escopo dos binds:** teste que confirma que `127.0.0.1:8478` (configuração) **não responde** a partir de outro host da rede, e que a API em `:8477` recusa origem fora da allowlist com `403` — antes de checar a API key
 
-**End-to-end sem hardware** — MediaMTX servindo 3 vídeos como RTSP local; dispara evento, verifica resultado e webhook. Roda em CI, sem câmera
+**End-to-end sem hardware**
+MediaMTX servindo 3 vídeos como RTSP local. Roda em CI, sem câmera nenhuma. É a diferença entre desenvolver bloqueado e desenvolver.
 
-**Antes de embarcar (inegociável)** — `recorder` gravando 24 h com corte de energia e de rede no meio · `aim` aferido contra medida real conhecida · `daily_report` acessado de fora da rede · os `.exe` em **Windows limpo, sem Python**
+**Paridade Paddle ↔ ONNX**
+200 imagens, saídas comparadas caractere a caractere. Divergência > 0,5% reprova o export.
 
-**⭐ Teste da rede desligada** — instalar em Windows limpo **com a placa de rede desabilitada**, reiniciar, processar um evento ponta a ponta. Confirmar com `netstat -b` que nada tenta sair. ⚠️ Verificar com `pyi-archive_viewer` que **`paddle` e `paddleocr` não entraram no executável** — ler o código não basta, um import indireto entra sem aviso
+**⭐ Teste da rede desligada (inegociável)**
+Instalar em Windows limpo **com a placa de rede desabilitada**, reiniciar a máquina, processar um evento ponta a ponta com câmeras numa rede isolada. Confirmar com `netstat -b` que nada tenta sair. Verificar com `pyi-archive_viewer` que **`paddle` e `paddleocr` não entraram no executável** — ler o código não basta, um import indireto entra sem aviso e só falha no cliente.
 
-**Em produção** — soak de 72 h · piloto em paralelo com a digitação manual (mede a acurácia real sem risco) · reboot confirmando que o serviço sobe sozinho
+**Antes de ir a campo**
+`recorder` gravando 24 h com corte de energia e de rede no meio · `aim` aferido contra medida real de trena · relatório diário acessado de fora da rede · o `.exe` rodando em Windows limpo, sem Python instalado
+
+**Em produção**
+Soak de 72 h · piloto em paralelo com a digitação manual · reboot confirmando que o serviço sobe sozinho, sem login
 
 ---
 
-## Anexo — Alternativas avaliadas e descartadas
+## 11. Riscos
 
-Registradas para não serem reabertas sem contexto.
-
-| Alternativa | Por que não |
+| Risco | Mitigação |
 |---|---|
-| **Câmera com OCR embarcado** (VIDAR, Vaxtor) | Reduziria o prazo para ~8 semanas, mas **open source é exigência da empresa**. Nota: Intelbras/Hikvision/Dahua só fazem ANPR (placas), nunca ISO 6346 |
-| **YOLO lendo caracteres direto** (36 classes) | Anotação de **110 h** contra 21 h — o PP-OCR já vem pré-treinado. E YOLO também redimensiona: 34 px viram 6 px na imagem completa |
-| **OCR na imagem inteira, sem recorte** | Todo modelo redimensiona a entrada. `3840×2160 → 960×540` transforma 34 px em 8 px. Além disso a lateral tem `MAX GROSS`, `TARE`, logos — dezenas de strings sem indicar qual é o código |
-| **PaddleOCR em runtime no cliente** | Falha ao iniciar offline mesmo com cache; arrasta PaddleX inteiro. E o nosso modelo é treinado — não vem de cache nenhum |
-| **Vídeo contínuo 24/7 na coleta** | 227–453 GB para cobrir um risco pequeno. Substituído por timelapse de 30 s (~6 GB) |
-| **Refazer o split do dataset público** | O vazamento envenena a métrica *daquele* dataset — e a nossa régua é o conjunto de validação 100% local |
+| 🔴 **Câmera montada longe demais** — modo de falha nº 1 | Volume de dados não corrige óptica. `aim` + alvo impresso **antes de furar**. 4K com zoom motorizado elimina o risco |
+| 🔴 **Voltar da coleta com dado inutilizável** | Relatório diário remoto · rodar o v0 sobre as imagens do dia 1 e revisar antes de deixar rodando |
+| 🟠 **Erro silencioso** — pior que não ler | `mod 11` deixa passar ~1 em 11 erros. Por isso a **concordância entre 3 câmeras** entra no critério de auto-aceite, não só o check digit. **KPI crítico: ≤0,5%** |
+| 🟠 **Divergência silenciosa na conversão ONNX** | Verificação de paridade obrigatória no CI de export |
+| 🟠 **Snapshot CGI limitado ou em baixa resolução** | Validar em bancada na semana 1. Plano B: decodificar RTSP main só na janela do evento |
+| 🟠 **Desempenho noturno da 4K** | Exigir Starlight, sensor ≥1/1.8", ≤0,005 lux **antes de comprar** |
+| 🟡 **Serviço `LocalSystem` não enxerga cache de usuário** | Resolvido por design: ONNX com caminho absoluto, nada baixado em runtime |
+| 🟡 **Disco enche e o serviço para** | Retenção obrigatória desde a fase 3, com alarme em `/health` |
+| 🟡 **API em HTTP puro numa rede que deixe de ser confiável** | Bind por IP + allowlist + UI só em loopback (§5.2/§5.3). Decisão documentada e `scheme` configurável, para que habilitar TLS depois não exija mudança de código |
+
+### Metas a acordar formalmente
+
+Auto-aceite correto **≥92%** · erro silencioso **≤0,5%** · resposta **≤3 s** · disponibilidade **≥99%**
 
 ---
 
 ## Resumo
 
-**Trocar complexidade de software por volume de dados:** coletar todos os eventos das duas semanas e manter o sistema em sete módulos simples.
-
-**A viagem entrega instalação correta e dataset — não sistema funcionando.** Isso vem depois, pela VPN.
-
-**Três ferramentas precisam estar prontas até outubro:** `recorder`, `aim`, `daily_report`.
-
-**Duas perguntas destravam a semana 1:** distância da câmera das portas, e orientação das portas.
-
-**A regra de ouro no local:** *medir com o alvo → conferir com o `aim` → só então furar.*
+1. **A fusão das 3 câmeras é a alavanca do projeto.** Mesmo código, três ângulos, votação por caractere + check digit. Vale mais que qualquer refinamento de modelo.
+2. **As VIP 5180 PAN leem — a ≤3,5 m e alinhadas com o código.** A 6 m, não. A montagem decide, não a câmera.
+3. **A 4K traseira deve ser varifocal motorizada** se o orçamento permitir. Elimina o risco de enquadramento, que é o mais caro do projeto.
+4. **Snapshot HTTP para OCR, substream RTSP para gatilho, ONVIF para controle.** Não é "RTSP ou outra coisa" — são três canais com papéis diferentes.
+5. **RapidOCR evita escrever a camada mais arriscada do sistema** (pré/pós-processamento ONNX do PP-OCR).
+6. **TRUDI está liberado** pela decisão de uso interno. Vale ~3.100 amostras reais.
+7. **3 câmeras tornam a meta de 3.000 imagens barata:** 1.000 eventos, 1 transcrição cada.
+8. **A pergunta de maior retorno:** o sistema principal exporta o log digitado pelo porteiro?
